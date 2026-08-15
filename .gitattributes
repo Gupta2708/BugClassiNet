@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+*.parquet binary
+*.joblib binary
+*.safetensors binary
+*.bin binary
+*.tar.gz binary
+*.ipynb text eol=lf

@@ -1,0 +1,7 @@
+nlbse2023:
+  source: NLBSE 2023 issue classification
+  processed_dir: data/processed/nlbse2023
+nlbse2024:
+  source: NLBSE 2024 issue classification
+mandelbugs:
+  source: Mandelbugs

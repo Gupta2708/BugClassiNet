@@ -1,0 +1,5 @@
+text_column: text
+label_column: canonical_label
+word_ngram_range: [1, 2]
+char_ngram_range: [3, 5]
+class_weight: balanced

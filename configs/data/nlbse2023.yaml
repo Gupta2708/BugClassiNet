@@ -1,0 +1,4 @@
+dataset: nlbse2023
+validation_fraction: 0.15
+seed: 42
+sample_size: 20000

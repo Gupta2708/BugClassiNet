@@ -1,0 +1,2 @@
+dataset: mandelbugs
+required_columns: [text, canonical_label, project]

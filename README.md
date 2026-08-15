@@ -1,0 +1,40 @@
+# BugClassiNet-Next
+
+Reproducible, hierarchical classification of software issues. Stage 1 labels an
+issue as `BUG`, `ENHANCEMENT`, `QUESTION`, or `DOCUMENTATION`; bug reports then
+route through BOH/MAN and ARB/NAM classifiers.
+
+## Local quick start
+
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements-dev.txt
+python -m bugclassinet.cli inspect-archive data/raw/nlbse2023/train.tar.gz
+python -m bugclassinet.cli prepare-nlbse --train-archive TRAIN.tar.gz --test-archive TEST.tar.gz
+python -m bugclassinet.cli train-tfidf --data-dir data/processed/nlbse2023 --output-dir outputs/models/tfidf
+python -m bugclassinet.cli evaluate-stage1 --model-path outputs/models/tfidf/model.joblib --test data/processed/nlbse2023/test.parquet
+```
+
+`prepare-nlbse` detects source columns, preserves them, produces Parquet files,
+and refuses ambiguous schemas. It never edits an official test set. It writes
+`train_benchmark.parquet`/`validation.parquet` plus test-isolated
+`train_clean.parquet`/`validation_clean.parquet`; package training defaults to
+the clean variants. Pass paths by arguments or YAML config; no platform-specific
+paths are embedded in code.
+
+## Kaggle
+
+Attach a dataset containing the source archives, install the project package in a
+notebook, set `--config configs/paths/kaggle.yaml`, and write artifacts to
+`/kaggle/working/outputs`. The provided notebooks are deliberately thin wrappers
+around `bugclassinet` package functions.
+
+## Quality
+
+```powershell
+python -m ruff check .
+python -m ruff format --check .
+pytest
+```
+
+Large raw data, processed data, checkpoints, and outputs are ignored by Git.
