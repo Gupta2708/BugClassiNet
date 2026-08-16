@@ -24,11 +24,21 @@ def resolved_tfidf_config(values: Mapping[str, Any] | None = None) -> dict[str, 
     """Resolve feature and classifier defaults for recording with artifacts."""
     values = values or {}
     feature_config = TfidfFeatureConfig.from_mapping(values)
-    return {
+    resolved = {
         **feature_config.as_dict(),
         "class_weight": values.get("class_weight", "balanced"),
         "classifier_max_iter": int(values.get("classifier_max_iter", 5_000)),
+        "seed": int(values.get("seed", 42)),
     }
+    for key in (
+        "max_train_samples",
+        "source_training_rows",
+        "training_rows",
+        "training_class_counts",
+    ):
+        if key in values:
+            resolved[key] = values[key]
+    return resolved
 
 
 def build_tfidf_pipeline(values: Mapping[str, Any] | None = None) -> Pipeline:

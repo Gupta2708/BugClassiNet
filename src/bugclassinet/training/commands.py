@@ -24,7 +24,18 @@ def _print(result: Any) -> None:
 
 
 def train_tfidf(args: Any) -> None:
-    _print(tfidf.run(args.data_dir, args.train, args.validation, args.output_dir, args.config))
+    if args.max_eval_samples is not None:
+        raise ValueError("TF-IDF evaluation always uses the complete validation split")
+    _print(
+        tfidf.run(
+            args.data_dir,
+            args.train,
+            args.validation,
+            args.output_dir,
+            args.config,
+            args.max_train_samples,
+        )
+    )
 
 
 def train_stage1(args: Any) -> None:

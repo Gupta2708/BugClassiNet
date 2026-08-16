@@ -1,4 +1,5 @@
 feature_mode: word
+seed: 42
 word_ngram_range: [1, 2]
 word_max_features: 200000
 word_min_df: 3

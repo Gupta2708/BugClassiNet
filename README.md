@@ -50,3 +50,9 @@ For million-row NLBSE training under constrained RAM, start with
 character features for a second, more memory-intensive benchmark. Both presets
 retain the complete validation split and log sparse matrix shape, dtype, nonzero
 count, and estimated storage before fitting `LinearSVC`.
+
+For a memory-safe scale-up, run the combined preset in separate processes with
+`--max-train-samples 200000`, then `--max-train-samples 500000`, and finally
+omit the option for all clean training rows. The bounded runs use an exact,
+deterministic, class-stratified subset (seed 42). Each run still evaluates the
+complete validation split; TF-IDF training rejects `--max-eval-samples`.
