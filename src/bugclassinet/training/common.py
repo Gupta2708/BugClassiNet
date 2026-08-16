@@ -15,7 +15,12 @@ def training_config(path: str | None, defaults: dict[str, Any]) -> dict[str, Any
     return {**defaults, **(load_yaml(path) if path else {})}
 
 
-def read_split(path: str | None, data_dir: str | None, split: str) -> pd.DataFrame:
+def read_split(
+    path: str | None,
+    data_dir: str | None,
+    split: str,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
     """Read a requested Parquet split, failing loudly when absent."""
     if path:
         source = Path(path)
@@ -25,4 +30,4 @@ def read_split(path: str | None, data_dir: str | None, split: str) -> pd.DataFra
         source = root / preferred.get(split, f"{split}.parquet")
     if not source.is_file():
         raise FileNotFoundError(f"Required {split} Parquet is missing: {source}")
-    return pd.read_parquet(source)
+    return pd.read_parquet(source, columns=columns)

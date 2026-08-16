@@ -1,12 +1,8 @@
-feature_mode: word_char
+feature_mode: word
 word_ngram_range: [1, 2]
 word_max_features: 200000
 word_min_df: 3
 word_max_df: 0.98
-char_ngram_range: [3, 5]
-char_max_features: 150000
-char_min_df: 5
-char_max_df: 0.98
 sublinear_tf: true
 class_weight: balanced
 classifier_max_iter: 5000

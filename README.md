@@ -15,6 +15,9 @@ python -m bugclassinet.cli train-tfidf --data-dir data/processed/nlbse2023 --out
 python -m bugclassinet.cli evaluate-stage1 --model-path outputs/models/tfidf/model.joblib --test data/processed/nlbse2023/test.parquet
 ```
 
+Install Transformer dependencies only in environments that train DeBERTa,
+ModernBERT, or DAPT: `pip install -r requirements-transformers.txt`.
+
 `prepare-nlbse` detects source columns, preserves them, produces Parquet files,
 and refuses ambiguous schemas. It never edits an official test set. It writes
 `train_benchmark.parquet`/`validation.parquet` plus test-isolated
@@ -38,3 +41,12 @@ pytest
 ```
 
 Large raw data, processed data, checkpoints, and outputs are ignored by Git.
+
+## Full-scale TF-IDF
+
+For million-row NLBSE training under constrained RAM, start with
+`configs/models/tfidf_stage1_word_only.yaml`. It uses at most 200,000 sparse
+`float32` word features. The `tfidf_stage1.yaml` preset adds at most 150,000
+character features for a second, more memory-intensive benchmark. Both presets
+retain the complete validation split and log sparse matrix shape, dtype, nonzero
+count, and estimated storage before fitting `LinearSVC`.

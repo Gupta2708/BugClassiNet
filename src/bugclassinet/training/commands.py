@@ -24,7 +24,7 @@ def _print(result: Any) -> None:
 
 
 def train_tfidf(args: Any) -> None:
-    _print(tfidf.run(args.data_dir, args.train, args.validation, args.output_dir))
+    _print(tfidf.run(args.data_dir, args.train, args.validation, args.output_dir, args.config))
 
 
 def train_stage1(args: Any) -> None:
