@@ -51,6 +51,11 @@ character features for a second, more memory-intensive benchmark. Both presets
 retain the complete validation split and log sparse matrix shape, dtype, nonzero
 count, and estimated storage before fitting `LinearSVC`.
 
+`configs/models/tfidf_stage1_word_only_500k.yaml` is a higher-capacity
+word-only benchmark with at most 500,000 unigram and bigram features. Compare it
+with the 200,000-feature word-only baseline on the same complete validation set;
+the larger vocabulary is not assumed to improve accuracy.
+
 For a memory-safe scale-up, run the combined preset in separate processes with
 `--max-train-samples 200000`, then `--max-train-samples 500000`, and finally
 omit the option for all clean training rows. The bounded runs use an exact,

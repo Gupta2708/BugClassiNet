@@ -1,0 +1,9 @@
+feature_mode: word
+seed: 42
+word_ngram_range: [1, 2]
+word_max_features: 500000
+word_min_df: 3
+word_max_df: 0.98
+sublinear_tf: true
+class_weight: balanced
+classifier_max_iter: 5000
