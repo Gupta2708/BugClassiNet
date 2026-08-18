@@ -91,9 +91,15 @@ def train_transformer(
     # which can incorrectly attempt to parse it as a tiktoken BPE file.
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=False)
+    use_fp16 = bool(torch.cuda.is_available())
     model = AutoModel.from_pretrained(
         config.model_name, num_labels=len(labels), label2id=label_to_id, id2label=id_to_label
     )
+    if use_fp16:
+        # The Microsoft checkpoint is stored with half-precision tensors. AMP's
+        # GradScaler requires trainable master parameters and their gradients to
+        # start in FP32; otherwise gradient unscaling fails on the first step.
+        model = model.float()
     weights = compute_class_weight("balanced", classes=np.array(labels), y=train["canonical_label"])
     weights_tensor = torch.tensor(weights, dtype=torch.float)
 
@@ -111,7 +117,6 @@ def train_transformer(
 
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    use_fp16 = bool(torch.cuda.is_available())
     arguments = TrainingArguments(
         output_dir=str(destination),
         learning_rate=config.learning_rate,
