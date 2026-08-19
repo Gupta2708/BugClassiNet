@@ -42,6 +42,19 @@ pytest
 
 Large raw data, processed data, checkpoints, and outputs are ignored by Git.
 
+## Full-scale DeBERTa Stage 1
+
+Stage 1 projects only the model columns from Parquet into a memory-mapped Arrow
+dataset. Bounded runs use an exact class-stratified subset (seed 42), and
+tokenization is written to a deterministic disk cache in bounded batches.
+Sequences remain variable length until `DataCollatorWithPadding` pads each
+training batch; truncation remains fixed at 256 tokens. DataLoader workers
+default to zero to avoid process-local dataset copies on Kaggle.
+
+Use `configs/models/deberta_stage1_kaggle_1epoch.yaml` for the 1-epoch Kaggle
+scaling experiment. Do not pass `--max-eval-samples`: every 50K/200K/500K/full
+training run must use the complete `validation_clean.parquet` split.
+
 ## Full-scale TF-IDF
 
 For million-row NLBSE training under constrained RAM, start with

@@ -2,19 +2,8 @@
 
 from __future__ import annotations
 
-import pandas as pd
-
 from bugclassinet.models.transformer_classifier import TransformerTrainingConfig, train_transformer
-from bugclassinet.training.common import read_split, training_config
-
-
-def _limit(frame: pd.DataFrame, maximum: int | None, seed: int) -> pd.DataFrame:
-    """Take a deterministic bounded subset for an explicit smoke run."""
-    if maximum is None or len(frame) <= maximum:
-        return frame
-    if maximum <= 0:
-        raise ValueError("Sample limits must be positive")
-    return frame.sample(n=maximum, random_state=seed).reset_index(drop=True)
+from bugclassinet.training.common import resolve_split_path, training_config
 
 
 def run(
@@ -29,6 +18,8 @@ def run(
     max_steps: int | None = None,
 ) -> dict[str, object]:
     """Train DeBERTa Stage 1 with a configurable, resumable implementation."""
+    if max_eval_samples is not None:
+        raise ValueError("Stage-1 evaluation always uses the complete validation split")
     config = training_config(config_path, {"model_name": "microsoft/deberta-v3-small"})
     allowed = set(TransformerTrainingConfig.__dataclass_fields__)
     values = {key: value for key, value in config.items() if key in allowed}
@@ -36,9 +27,10 @@ def run(
         values["max_steps"] = max_steps
     model_config = TransformerTrainingConfig(**values)
     return train_transformer(
-        _limit(read_split(train, data_dir, "train"), max_train_samples, model_config.seed),
-        _limit(read_split(validation, data_dir, "validation"), max_eval_samples, model_config.seed),
+        resolve_split_path(train, data_dir, "train"),
+        resolve_split_path(validation, data_dir, "validation"),
         output_dir,
         model_config,
         checkpoint,
+        max_train_samples=max_train_samples,
     )
