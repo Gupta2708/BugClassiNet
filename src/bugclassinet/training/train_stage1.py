@@ -16,6 +16,8 @@ def run(
     max_train_samples: int | None = None,
     max_eval_samples: int | None = None,
     max_steps: int | None = None,
+    stop_after_steps: int | None = None,
+    skip_final_evaluation: bool = False,
 ) -> dict[str, object]:
     """Train DeBERTa Stage 1 with a configurable, resumable implementation."""
     if max_eval_samples is not None:
@@ -33,4 +35,6 @@ def run(
         model_config,
         checkpoint,
         max_train_samples=max_train_samples,
+        stop_after_steps=stop_after_steps,
+        skip_final_evaluation=skip_final_evaluation,
     )

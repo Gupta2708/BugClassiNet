@@ -103,10 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--model-path")
         sub.add_argument("--output-dir", default="outputs")
         sub.add_argument("--checkpoint")
+        sub.add_argument("--resume-from-checkpoint")
         sub.add_argument("--threshold", type=float, default=0.0)
         sub.add_argument("--max-train-samples", type=int)
         sub.add_argument("--max-eval-samples", type=int)
         sub.add_argument("--max-steps", type=int)
+        sub.add_argument("--stop-after-steps", type=int)
+        sub.add_argument("--skip-final-evaluation", action="store_true")
         sub.set_defaults(func=_deferred(handler))
     return parser
 

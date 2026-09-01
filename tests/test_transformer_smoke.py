@@ -77,8 +77,9 @@ def test_dataframe_adapter_preserves_validation_metadata(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("cuda_available", [False, True])
+@pytest.mark.parametrize("checkpoint_steps", [None, 1000])
 def test_stage1_trainer_uses_memory_safe_tokenization(
-    tmp_path, monkeypatch, cuda_available: bool
+    tmp_path, monkeypatch, cuda_available: bool, checkpoint_steps: int | None
 ) -> None:
     class Tokenizer:
         def __init__(self) -> None:
@@ -107,9 +108,41 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.train_dataset = kwargs["train_dataset"]
+            self.state = SimpleNamespace(global_step=0, max_steps=2)
             created["eval_dataset"] = kwargs["eval_dataset"]
+            created["callbacks"] = kwargs["callbacks"]
 
         def train(self, **kwargs):
+            created["train_kwargs"] = kwargs
+            control = SimpleNamespace(should_save=False, should_training_stop=False)
+            for callback in self.kwargs["callbacks"]:
+                if hasattr(callback, "on_train_begin"):
+                    callback.on_train_begin(None, self.state, control)
+            self.state.global_step = self.state.max_steps
+            for callback in self.kwargs["callbacks"]:
+                if hasattr(callback, "on_step_end"):
+                    callback.on_step_end(None, self.state, control)
+            if control.should_save:
+                checkpoint = tmp_path / f"checkpoint-{self.state.global_step}"
+                checkpoint.mkdir()
+                for name in (
+                    "optimizer.pt",
+                    "scheduler.pt",
+                    "rng_state.pth",
+                    "model.safetensors",
+                ):
+                    (checkpoint / name).write_text("fixture", encoding="utf-8")
+                (checkpoint / "trainer_state.json").write_text(
+                    '{"global_step": 2}', encoding="utf-8"
+                )
+                if cuda_available:
+                    (checkpoint / "scaler.pt").write_text("fixture", encoding="utf-8")
+                for callback in self.kwargs["callbacks"]:
+                    if hasattr(callback, "on_save"):
+                        callback.on_save(None, self.state, control)
+            for callback in self.kwargs["callbacks"]:
+                if hasattr(callback, "on_train_end"):
+                    callback.on_train_end(None, self.state, control)
             return None
 
         def evaluate(self):
@@ -155,6 +188,7 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
             make_collator,
             lambda **kwargs: object(),
             Trainer,
+            object,
             make_arguments,
         ),
     )
@@ -198,7 +232,12 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
         train,
         validation,
         tmp_path,
-        TransformerTrainingConfig(model_name="tiny", epochs=1),
+        TransformerTrainingConfig(
+            model_name="tiny",
+            epochs=1,
+            checkpoint_steps=checkpoint_steps,
+            save_total_limit=2,
+        ),
     )
 
     assert metrics["eval_macro_f1"] == 1.0
@@ -206,6 +245,24 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
     assert created["arguments"]["fp16"] is cuda_available
     assert created["arguments"]["dataloader_num_workers"] == 0
     assert created["arguments"]["dataloader_persistent_workers"] is False
+    assert created["arguments"]["eval_strategy"] == (
+        "no" if checkpoint_steps is not None else "epoch"
+    )
+    assert created["arguments"]["save_strategy"] == (
+        "steps" if checkpoint_steps is not None else "epoch"
+    )
+    assert created["arguments"]["save_steps"] == (checkpoint_steps or 500)
+    assert created["arguments"]["save_total_limit"] == 2
+    assert created["arguments"]["load_best_model_at_end"] is (checkpoint_steps is None)
+    assert created["arguments"]["ignore_data_skip"] is False
+    assert created["train_kwargs"] == {"resume_from_checkpoint": None}
+    callbacks = created["callbacks"]
+    periodic = next(callback for callback in callbacks if hasattr(callback, "on_step_end"))
+    control = SimpleNamespace(should_save=False, should_training_stop=False)
+    periodic.on_step_end(None, SimpleNamespace(global_step=999, max_steps=2000), control)
+    assert control.should_save is False
+    periodic.on_step_end(None, SimpleNamespace(global_step=2000, max_steps=2000), control)
+    assert control.should_save is (checkpoint_steps is not None)
     assert created["collator"] == {
         "tokenizer": tokenizer,
         "padding": True,

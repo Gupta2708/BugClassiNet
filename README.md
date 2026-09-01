@@ -53,7 +53,16 @@ default to zero to avoid process-local dataset copies on Kaggle.
 
 Use `configs/models/deberta_stage1_kaggle_1epoch.yaml` for the 1-epoch Kaggle
 scaling experiment. Do not pass `--max-eval-samples`: every 50K/200K/500K/full
-training run must use the complete `validation_clean.parquet` split.
+training run must use the complete `validation_clean.parquet` split. This
+Kaggle preset writes a normal, fully resumable Trainer checkpoint every 2,000
+optimizer steps and retains the latest two. `--stop-after-steps N` requests a
+full checkpoint and graceful stop without changing the one-epoch Trainer plan
+or learning-rate schedule. Intermediate segments skip validation with
+`--skip-final-evaluation`; the resumed final segment runs the complete
+validation split. Resume with `--resume-from-checkpoint /path/to/checkpoint-N`.
+The checkpoint manifest rejects changes to the dataset, label mapping, model
+revision, seed, device count, precision, or training configuration, and Trainer
+data skipping remains enabled so completed batches are not replayed.
 
 ## Full-scale TF-IDF
 

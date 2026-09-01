@@ -37,7 +37,11 @@ def test_stage1_forwards_paths_and_limits_without_loading_pandas(tmp_path, monke
 
     assert result == {"ok": True}
     assert captured["args"][0:2] == (Path(train), Path(validation))
-    assert captured["kwargs"] == {"max_train_samples": 500_000}
+    assert captured["kwargs"] == {
+        "max_train_samples": 500_000,
+        "stop_after_steps": None,
+        "skip_final_evaluation": False,
+    }
 
 
 def test_stage1_rejects_reduced_validation(tmp_path) -> None:

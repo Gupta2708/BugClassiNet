@@ -39,6 +39,9 @@ def train_tfidf(args: Any) -> None:
 
 
 def train_stage1(args: Any) -> None:
+    if args.checkpoint and args.resume_from_checkpoint:
+        raise ValueError("Use only --resume-from-checkpoint; do not also pass --checkpoint")
+    resume_from_checkpoint = args.resume_from_checkpoint or args.checkpoint
     _print(
         stage1.run(
             args.data_dir,
@@ -46,10 +49,12 @@ def train_stage1(args: Any) -> None:
             args.validation,
             args.output_dir,
             args.config,
-            args.checkpoint,
+            resume_from_checkpoint,
             args.max_train_samples,
             args.max_eval_samples,
             args.max_steps,
+            args.stop_after_steps,
+            args.skip_final_evaluation,
         )
     )
 
