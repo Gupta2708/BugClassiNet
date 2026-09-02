@@ -74,6 +74,14 @@ original checkpoint is never rewritten, and training cannot begin unless the
 resulting sequence-classification state is strictly complete, including the
 classifier and pooler.
 
+Stage-1 class weighting is controlled by `class_weight_strategy`: `balanced`
+(the backward-compatible default), `sqrt_balanced`, `none`, or `custom` with an
+explicit `class_weights` mapping. The 200K/256-token ablation presets share all
+other hyperparameters and must be run with `--max-train-samples 200000`; each
+manifest records the ordered sample fingerprint. Validation metrics include
+all aggregate and per-class scores plus the confusion matrix, while validation
+predictions retain true/predicted labels and one logit column per class.
+
 ## Full-scale TF-IDF
 
 For million-row NLBSE training under constrained RAM, start with

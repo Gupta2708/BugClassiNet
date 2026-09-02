@@ -15,6 +15,7 @@ from sklearn.model_selection import StratifiedShuffleSplit
 
 _INSPECTION_BATCH_SIZE = 8_192
 _LABEL_BATCH_SIZE = 65_536
+_SAMPLE_FINGERPRINT_VERSION = "ordered-training-sample-v1"
 
 
 def _dataset_class() -> Any:
@@ -88,6 +89,25 @@ def _compact_label_ids(dataset: Any) -> np.ndarray:
 def _safe_cache_component(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip("-.")
     return safe or "split"
+
+
+def stable_sample_fingerprint(dataset: Any) -> str:
+    """Hash the ordered training identities without materializing Python row copies."""
+    identity_columns = (
+        ["issue_id"] if "issue_id" in dataset.column_names else ["text", "canonical_label"]
+    )
+    identity = dataset.select_columns(identity_columns)
+    digest = hashlib.sha256()
+    digest.update(_SAMPLE_FINGERPRINT_VERSION.encode("utf-8"))
+    digest.update(len(dataset).to_bytes(8, "big", signed=False))
+    for batch in identity.iter(batch_size=_LABEL_BATCH_SIZE):
+        batch_size = len(batch[identity_columns[0]])
+        for position in range(batch_size):
+            for column in identity_columns:
+                value = str(batch[column][position]).encode("utf-8")
+                digest.update(len(value).to_bytes(8, "big", signed=False))
+                digest.update(value)
+    return digest.hexdigest()
 
 
 def stratified_limit(

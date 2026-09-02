@@ -109,6 +109,19 @@ def test_stratified_limit_is_exact_deterministic_and_disk_backed(tmp_path):
     assert "train-clean-n50-seed42" in options["indices_cache_file_name"]
 
 
+def test_sample_fingerprint_proves_seeded_ordered_selection(tmp_path):
+    source = FakeDataset(_rows())
+    first = data_module.stratified_limit(source, 50, 42, tmp_path, "first")
+    repeated = data_module.stratified_limit(source, 50, 42, tmp_path, "repeated")
+    different_seed = data_module.stratified_limit(source, 50, 43, tmp_path, "different")
+
+    first_fingerprint = data_module.stable_sample_fingerprint(first)
+
+    assert first_fingerprint == data_module.stable_sample_fingerprint(repeated)
+    assert first_fingerprint != data_module.stable_sample_fingerprint(different_seed)
+    assert len(first) == len(repeated) == len(different_seed) == 50
+
+
 def test_stratified_limit_validates_limit_and_bypasses_unneeded_sampling(tmp_path):
     source = FakeDataset(_rows())
     assert data_module.stratified_limit(source, None, 42, tmp_path, "train") is source

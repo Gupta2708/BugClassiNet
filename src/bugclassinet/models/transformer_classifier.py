@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 from bugclassinet.data.transformer import (
     inspect_dataset,
     load_parquet_dataset,
+    stable_sample_fingerprint,
     stratified_limit,
 )
 from bugclassinet.evaluation.metrics import classification_metrics
@@ -368,6 +369,20 @@ def _validate_resume_manifest(
             "checksum metadata"
         )
 
+    ablation_identity_fields = (
+        "train_sample_fingerprint",
+        "train_sample_rows",
+        "train_sample_seed",
+        "train_sample_limit",
+        "class_weight_strategy",
+        "class_weights_by_label",
+        "class_weight_ratios_to_bug",
+        "cross_entropy_weighted",
+        "cross_entropy_class_weights",
+        "max_length",
+    )
+    compared = (*compared, *(key for key in ablation_identity_fields if key in stored))
+
     mismatches = [key for key in compared if stored.get(key) != current.get(key)]
     if mismatches:
         details = ", ".join(
@@ -511,6 +526,22 @@ class TransformerTrainingConfig:
     dataset_cache_dir: str | None = None
     checkpoint_steps: int | None = None
     save_total_limit: int | None = None
+    class_weight_strategy: str = "balanced"
+    class_weights: dict[str, float] | None = None
+
+    def __post_init__(self) -> None:
+        supported = {"balanced", "sqrt_balanced", "none", "custom"}
+        if self.class_weight_strategy not in supported:
+            raise ValueError(
+                f"Invalid class_weight_strategy={self.class_weight_strategy!r}; "
+                f"expected one of {sorted(supported)}"
+            )
+        if self.class_weight_strategy == "custom" and not self.class_weights:
+            raise ValueError("class_weight_strategy='custom' requires class_weights")
+        if self.class_weight_strategy != "custom" and self.class_weights is not None:
+            raise ValueError(
+                "class_weights may only be provided when class_weight_strategy='custom'"
+            )
 
 
 def _dependencies() -> tuple[Any, ...]:
@@ -645,7 +676,7 @@ def _load_inputs(
     if isinstance(train, (str, Path)) and isinstance(validation, (str, Path)):
         log_memory(LOGGER, "before dataset load")
         train_dataset = load_parquet_dataset(
-            Path(train), ["text", "canonical_label"], cache_dir / "raw-train"
+            Path(train), ["issue_id", "text", "canonical_label"], cache_dir / "raw-train"
         )
         validation_dataset = load_parquet_dataset(
             Path(validation),
@@ -685,6 +716,39 @@ def _load_inputs(
 def _balanced_weights(labels: list[str], counts: dict[str, int]) -> np.ndarray:
     total = sum(counts.values())
     return np.asarray([total / (len(labels) * counts[label]) for label in labels], dtype=np.float64)
+
+
+def _resolve_class_weights(
+    labels: list[str],
+    counts: dict[str, int],
+    strategy: str,
+    custom: dict[str, float] | None = None,
+) -> np.ndarray | None:
+    balanced = _balanced_weights(labels, counts)
+    if strategy == "balanced":
+        return balanced
+    if strategy == "sqrt_balanced":
+        return np.sqrt(balanced)
+    if strategy == "none":
+        return None
+    if strategy != "custom":
+        raise ValueError(f"Invalid class_weight_strategy={strategy!r}")
+    if custom is None:
+        raise ValueError("class_weight_strategy='custom' requires class_weights")
+    missing = sorted(set(labels) - set(custom))
+    unexpected = sorted(set(custom) - set(labels))
+    if missing or unexpected:
+        raise ValueError(
+            "Custom class_weights must exactly match the training labels: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    try:
+        weights = np.asarray([custom[label] for label in labels], dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Custom class_weights must be numeric") from error
+    if not np.all(np.isfinite(weights)) or np.any(weights <= 0):
+        raise ValueError("Custom class_weights must be finite and greater than zero")
+    return weights
 
 
 def train_transformer(
@@ -760,10 +824,18 @@ def train_transformer(
     id_to_label = {index: label for label, index in label_to_id.items()}
     train_fingerprint = _dataset_fingerprint(train)
     validation_fingerprint = _dataset_fingerprint(validation)
+    train_sample_fingerprint = stable_sample_fingerprint(train)
     train_schema_columns = list(train.column_names)
     validation_schema_columns = list(validation.column_names)
     LOGGER.info("Stage-1 training class counts=%s", train_counts)
     LOGGER.info("Stage-1 validation class counts=%s", validation_counts)
+    LOGGER.info(
+        "Stage-1 ordered sample fingerprint=%s rows=%d seed=%d sample_limit=%s",
+        train_sample_fingerprint,
+        len(train),
+        config.seed,
+        max_train_samples,
+    )
 
     # DeBERTa-v3 ships a SentencePiece model. Avoid fast-tokenizer conversion,
     # which can incorrectly attempt to parse it as a tiktoken BPE file.
@@ -797,9 +869,34 @@ def train_transformer(
         # AMP's GradScaler requires trainable master parameters and gradients in
         # FP32. The Microsoft checkpoint itself may contain FP16 tensors.
         model = model.float()
-    balanced_weights = _balanced_weights(labels, train_counts)
-    weights_tensor = torch.tensor(balanced_weights, dtype=torch.float)
-    class_weights = balanced_weights.tolist()
+    selected_weights = _resolve_class_weights(
+        labels,
+        train_counts,
+        config.class_weight_strategy,
+        config.class_weights,
+    )
+    effective_weights = (
+        np.ones(len(labels), dtype=np.float64) if selected_weights is None else selected_weights
+    )
+    weights_tensor = (
+        None if selected_weights is None else torch.tensor(selected_weights, dtype=torch.float)
+    )
+    class_weights = effective_weights.tolist()
+    class_weights_by_label = dict(zip(labels, class_weights, strict=True))
+    if "BUG" not in class_weights_by_label:
+        raise ValueError("Stage-1 class weights require the BUG reference class")
+    bug_weight = class_weights_by_label["BUG"]
+    weight_ratios_to_bug = {
+        label: weight / bug_weight for label, weight in class_weights_by_label.items()
+    }
+    LOGGER.info(
+        "Stage-1 loss class_weight_strategy=%s class_counts=%s class_weights=%s "
+        "weight_ratios_to_bug=%s",
+        config.class_weight_strategy,
+        train_counts,
+        class_weights_by_label,
+        weight_ratios_to_bug,
+    )
     preloaded_resume_checkpoint: str | None = None
     resume_state_summary: dict[str, int | float] | None = None
 
@@ -809,10 +906,15 @@ def train_transformer(
         ) -> Any:
             labels_tensor = inputs.pop("labels")
             outputs = model(**inputs)
-            class_weights = weights_tensor.to(
-                device=outputs.logits.device, dtype=outputs.logits.dtype
+            loss_weights = (
+                None
+                if weights_tensor is None
+                else weights_tensor.to(
+                    device=outputs.logits.device,
+                    dtype=outputs.logits.dtype,
+                )
             )
-            loss = torch.nn.CrossEntropyLoss(weight=class_weights)(outputs.logits, labels_tensor)
+            loss = torch.nn.CrossEntropyLoss(weight=loss_weights)(outputs.logits, labels_tensor)
             return (loss, outputs) if return_outputs else loss
 
         def _load_from_checkpoint(self, resume_from_checkpoint: str, model: Any = None) -> None:
@@ -889,6 +991,11 @@ def train_transformer(
 
     config_for_hash = asdict(config)
     config_for_hash.pop("dataset_cache_dir", None)
+    if config.class_weight_strategy == "balanced" and config.class_weights is None:
+        # Preserve checkpoint compatibility with manifests written before the
+        # configurable strategy fields existed; balanced was the only behavior.
+        config_for_hash.pop("class_weight_strategy", None)
+        config_for_hash.pop("class_weights", None)
     training_settings = {
         "max_length": config.max_length,
         "batch_size": config.batch_size,
@@ -918,6 +1025,10 @@ def train_transformer(
         ),
         "training_rows": len(tokenized_train),
         "train_rows": len(tokenized_train),
+        "train_sample_fingerprint": train_sample_fingerprint,
+        "train_sample_rows": len(tokenized_train),
+        "train_sample_seed": config.seed,
+        "train_sample_limit": max_train_samples,
         "validation_rows": len(tokenized_validation),
         "train_class_counts": train_counts,
         "validation_class_counts": validation_counts,
@@ -948,6 +1059,14 @@ def train_transformer(
         "label_mapping": label_to_id,
         "label_mapping_hash": _json_hash(label_to_id),
         "class_weights": class_weights,
+        "class_weights_by_label": class_weights_by_label,
+        "class_weight_ratios_to_bug": weight_ratios_to_bug,
+        "class_weight_strategy": config.class_weight_strategy,
+        "cross_entropy_weighted": selected_weights is not None,
+        "cross_entropy_class_weights": (
+            None if selected_weights is None else selected_weights.tolist()
+        ),
+        "max_length": config.max_length,
         "training_settings": training_settings,
         "expected_total_optimizer_steps": None,
         "starting_global_step": 0,
@@ -977,11 +1096,15 @@ def train_transformer(
         truth = [id_to_label[int(value)] for value in prediction.label_ids]
         output = [id_to_label[int(value)] for value in predicted]
         metrics = classification_metrics(truth, output)
-        return {
-            key: float(value)
-            for key, value in metrics.items()
-            if key.endswith("_f1") or key == "mcc"
-        }
+        scalar_keys = (
+            "accuracy",
+            "macro_f1",
+            "micro_f1",
+            "weighted_f1",
+            "mcc",
+            "balanced_accuracy",
+        )
+        return {key: float(metrics[key]) for key in scalar_keys}
 
     data_collator = DataCollator(tokenizer=tokenizer, padding=True, return_tensors="pt")
     execution_callback = _make_execution_callback(
@@ -1042,16 +1165,44 @@ def train_transformer(
     metrics = trainer.evaluate()
     trainer.save_model(destination)
     tokenizer.save_pretrained(destination)
-    (destination / "validation_metrics.json").write_text(
-        json.dumps(metrics, indent=2, default=float) + "\n", encoding="utf-8"
-    )
 
     # Reuse the exact evaluation token table; do not tokenize validation twice.
     prediction = trainer.predict(tokenized_validation)
-    predicted_labels = [
-        id_to_label[int(value)] for value in np.argmax(prediction.predictions, axis=1)
-    ]
-    prediction_rows = validation_metadata.add_column("prediction", predicted_labels)
+    logits = np.asarray(prediction.predictions)
+    if logits.ndim != 2 or logits.shape != (len(tokenized_validation), len(labels)):
+        raise ValueError(
+            "Unexpected Stage-1 prediction shape: "
+            f"expected={(len(tokenized_validation), len(labels))}, actual={logits.shape}"
+        )
+    predicted_labels = [id_to_label[int(value)] for value in np.argmax(logits, axis=1)]
+    true_labels = list(validation_metadata["canonical_label"])
+    full_metrics = classification_metrics(true_labels, predicted_labels)
+    validation_metrics = {
+        "eval_loss": float(metrics["eval_loss"]),
+        "accuracy": full_metrics["accuracy"],
+        "macro_f1": full_metrics["macro_f1"],
+        "micro_f1": full_metrics["micro_f1"],
+        "weighted_f1": full_metrics["weighted_f1"],
+        "mcc": full_metrics["mcc"],
+        "balanced_accuracy": full_metrics["balanced_accuracy"],
+        "labels": full_metrics["labels"],
+        "per_class": {label: full_metrics["per_class"][label] for label in full_metrics["labels"]},
+        "confusion_matrix": {
+            "labels": full_metrics["labels"],
+            "matrix": full_metrics["confusion_matrix"],
+        },
+    }
+    (destination / "validation_metrics.json").write_text(
+        json.dumps(validation_metrics, indent=2, default=float) + "\n",
+        encoding="utf-8",
+    )
+
+    prediction_rows = validation_metadata.add_column("true_label", true_labels)
+    prediction_rows = prediction_rows.add_column("predicted_label", predicted_labels)
+    prediction_rows = prediction_rows.add_column("prediction", predicted_labels)
+    float_logits = logits.astype(np.float32, copy=False)
+    for index, label in enumerate(labels):
+        prediction_rows = prediction_rows.add_column(f"logit_{label}", float_logits[:, index])
     prediction_rows.to_parquet(str(destination / "validation_predictions.parquet"))
     manifest["status"] = "completed"
     _write_run_manifest(destination / "run_manifest.json", manifest)

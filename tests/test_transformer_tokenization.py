@@ -198,3 +198,23 @@ def test_dynamic_tokenization_matches_legacy_semantics_and_metrics() -> None:
     assert classification_metrics(truth, legacy_output) == classification_metrics(
         truth, dynamic_output
     )
+
+
+def test_max_length_changes_only_truncation_not_labels() -> None:
+    batch = {
+        "text": ["one two three four five six", "short"],
+        "canonical_label": ["QUESTION", "BUG"],
+    }
+    label_to_id = {"BUG": 0, "QUESTION": 1}
+    tokenizer = DeterministicTokenizer()
+
+    at_four = _tokenize_batch(batch, tokenizer, label_to_id, max_length=4)
+    at_eight = _tokenize_batch(batch, tokenizer, label_to_id, max_length=8)
+
+    assert len(at_four["input_ids"][0]) == 4
+    assert len(at_eight["input_ids"][0]) == 8
+    assert at_four["labels"] == at_eight["labels"] == [1, 0]
+    assert tokenizer.calls == [
+        {"truncation": True, "max_length": 4, "padding": False},
+        {"truncation": True, "max_length": 8, "padding": False},
+    ]

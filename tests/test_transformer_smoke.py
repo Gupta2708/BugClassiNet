@@ -46,6 +46,14 @@ class FakeDataset:
             fingerprint=self._fingerprint,
         )
 
+    def iter(self, batch_size):
+        for start in range(0, len(self.rows), batch_size):
+            rows = self.rows[start : start + batch_size]
+            yield {column: [row[column] for row in rows] for column in self.column_names}
+
+    def __getitem__(self, column):
+        return [row[column] for row in self.rows]
+
     def add_column(self, name, values):
         rows = [dict(row) for row in self.rows]
         for row, value in zip(rows, values, strict=True):
@@ -146,7 +154,7 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
             return None
 
         def evaluate(self):
-            return {"eval_macro_f1": 1.0}
+            return {"eval_loss": 0.25, "eval_macro_f1": 1.0}
 
         def save_model(self, output):
             return None
@@ -286,5 +294,16 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
         "issue_id",
         "project",
         "canonical_label",
+        "true_label",
+        "predicted_label",
         "prediction",
+        "logit_BUG",
+        "logit_DOCUMENTATION",
     ]
+    validation_metrics = pd.read_json(tmp_path / "validation_metrics.json", typ="series")
+    assert validation_metrics["eval_loss"] == 0.25
+    assert validation_metrics["accuracy"] == 1.0
+    manifest = pd.read_json(tmp_path / "run_manifest.json", typ="series")
+    assert manifest["class_weight_strategy"] == "balanced"
+    assert manifest["train_sample_rows"] == 2
+    assert len(manifest["train_sample_fingerprint"]) == 64
