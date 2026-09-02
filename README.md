@@ -68,6 +68,12 @@ model revision, seed, device count, precision, optimizer-step horizon, or traini
 configuration, and Trainer data skipping remains enabled so completed batches
 are not replayed.
 
+Legacy DeBERTa Stage-1 checkpoints whose fine-tuned LayerNorm tensors use
+`.gamma`/`.beta` are remapped in memory to `.weight`/`.bias` during resume. The
+original checkpoint is never rewritten, and training cannot begin unless the
+resulting sequence-classification state is strictly complete, including the
+classifier and pooler.
+
 ## Full-scale TF-IDF
 
 For million-row NLBSE training under constrained RAM, start with

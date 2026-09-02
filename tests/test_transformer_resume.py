@@ -2,6 +2,7 @@ import json
 import shutil
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -70,6 +71,13 @@ def _parquet_identities(tmp_path):
     return (
         module._source_file_identity(train, ["text", "canonical_label"]),
         module._source_file_identity(validation, ["issue_id", "text", "canonical_label"]),
+    )
+
+
+def _write_trainer_state(checkpoint, global_step: int = 4) -> None:
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": global_step, "max_steps": 10, "epoch": 0.4}),
+        encoding="utf-8",
     )
 
 
@@ -157,11 +165,122 @@ def test_split_resume_matches_uninterrupted_global_and_scheduler_steps(tmp_path)
     assert first[4].final_checkpoint.endswith("checkpoint-4")
 
 
+def _synthetic_model_state() -> dict[str, object]:
+    return {
+        "deberta.encoder.layer.0.output.LayerNorm.weight": np.array([0.0, 0.0], dtype=np.float32),
+        "deberta.encoder.layer.0.output.LayerNorm.bias": np.array([0.0, 0.0], dtype=np.float32),
+        "pooler.dense.weight": np.array([0.0], dtype=np.float32),
+        "classifier.weight": np.array([0.0], dtype=np.float32),
+    }
+
+
+def _synthetic_legacy_checkpoint_state() -> dict[str, object]:
+    return {
+        "deberta.encoder.layer.0.output.LayerNorm.gamma": np.array([1.25, -2.5], dtype=np.float32),
+        "deberta.encoder.layer.0.output.LayerNorm.beta": np.array([0.5, 3.0], dtype=np.float32),
+        "pooler.dense.weight": np.array([4.0], dtype=np.float32),
+        "classifier.weight": np.array([5.0], dtype=np.float32),
+    }
+
+
+def test_legacy_layer_norm_keys_are_remapped_without_changing_tensors() -> None:
+    model_state = _synthetic_model_state()
+    checkpoint_state = _synthetic_legacy_checkpoint_state()
+    gamma = checkpoint_state["deberta.encoder.layer.0.output.LayerNorm.gamma"]
+    beta = checkpoint_state["deberta.encoder.layer.0.output.LayerNorm.beta"]
+
+    remapped, counts = module._remap_legacy_layer_norm_keys(checkpoint_state, model_state)
+
+    assert counts == {"gamma_to_weight": 1, "beta_to_bias": 1}
+    assert "deberta.encoder.layer.0.output.LayerNorm.gamma" not in remapped
+    assert "deberta.encoder.layer.0.output.LayerNorm.beta" not in remapped
+    assert remapped["deberta.encoder.layer.0.output.LayerNorm.weight"] is gamma
+    assert remapped["deberta.encoder.layer.0.output.LayerNorm.bias"] is beta
+    assert checkpoint_state["deberta.encoder.layer.0.output.LayerNorm.gamma"] is gamma
+    assert checkpoint_state["deberta.encoder.layer.0.output.LayerNorm.beta"] is beta
+    module._assert_strict_model_state_compatibility(remapped, model_state)
+
+
+def test_strict_restore_verifies_classifier_and_pooler(tmp_path, monkeypatch, caplog) -> None:
+    class FakeModel:
+        def __init__(self) -> None:
+            self.state = _synthetic_model_state()
+
+        def state_dict(self):
+            return self.state
+
+        def load_state_dict(self, state, strict):
+            assert strict is True
+            self.state = dict(state)
+
+    checkpoint_state = _synthetic_legacy_checkpoint_state()
+    monkeypatch.setattr(
+        module,
+        "_load_checkpoint_model_state",
+        lambda checkpoint, torch: checkpoint_state,
+    )
+    model = FakeModel()
+
+    with caplog.at_level("INFO"):
+        counts = module._restore_checkpoint_model_state(model, tmp_path, object())
+
+    assert counts == {"gamma_to_weight": 1, "beta_to_bias": 1, "total_remapped": 2}
+    assert np.array_equal(model.state["classifier.weight"], checkpoint_state["classifier.weight"])
+    assert np.array_equal(
+        model.state["pooler.dense.weight"], checkpoint_state["pooler.dense.weight"]
+    )
+    assert "missing=0 unexpected=0" in caplog.text
+    assert "classifier_parameters_verified=1 pooler_parameters_verified=1" in caplog.text
+
+
+def test_legacy_layer_norm_shape_mismatch_is_rejected() -> None:
+    model_state = _synthetic_model_state()
+    checkpoint_state = _synthetic_legacy_checkpoint_state()
+    checkpoint_state["deberta.encoder.layer.0.output.LayerNorm.gamma"] = np.array(
+        [1.0], dtype=np.float32
+    )
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        module._remap_legacy_layer_norm_keys(checkpoint_state, model_state)
+
+
+def test_legacy_layer_norm_incompatible_dtype_is_rejected() -> None:
+    model_state = _synthetic_model_state()
+    checkpoint_state = _synthetic_legacy_checkpoint_state()
+    checkpoint_state["deberta.encoder.layer.0.output.LayerNorm.gamma"] = np.array(
+        [1, 2], dtype=np.int32
+    )
+
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        module._remap_legacy_layer_norm_keys(checkpoint_state, model_state)
+
+
+def test_legacy_layer_norm_collision_is_rejected() -> None:
+    model_state = _synthetic_model_state()
+    checkpoint_state = _synthetic_legacy_checkpoint_state()
+    checkpoint_state["deberta.encoder.layer.0.output.LayerNorm.weight"] = np.array(
+        [8.0, 9.0], dtype=np.float32
+    )
+
+    with pytest.raises(ValueError, match="remap collision"):
+        module._remap_legacy_layer_norm_keys(checkpoint_state, model_state)
+
+
+def test_unrelated_model_state_incompatibility_is_rejected() -> None:
+    model_state = _synthetic_model_state()
+    checkpoint_state = _synthetic_legacy_checkpoint_state()
+    checkpoint_state["unrelated.weight"] = checkpoint_state.pop("classifier.weight")
+    remapped, _ = module._remap_legacy_layer_norm_keys(checkpoint_state, model_state)
+
+    with pytest.raises(ValueError, match=r"missing=.*classifier\.weight.*unexpected=.*unrelated"):
+        module._assert_strict_model_state_compatibility(remapped, model_state)
+
+
 def test_different_hf_fingerprints_resume_when_source_sha_matches(tmp_path) -> None:
     train_identity, validation_identity = _parquet_identities(tmp_path)
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
-    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 4}), encoding="utf-8")
+    _write_trainer_state(checkpoint)
     stored = _stable_manifest(train_identity, validation_identity)
     current = dict(stored)
     current["dataset_fingerprint"] = "hf-session-b"
@@ -176,7 +295,7 @@ def test_different_parquet_content_is_rejected(tmp_path) -> None:
     train_identity, validation_identity = _parquet_identities(tmp_path)
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
-    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 4}), encoding="utf-8")
+    _write_trainer_state(checkpoint)
     stored = _stable_manifest(train_identity, validation_identity)
     changed = tmp_path / "changed.parquet"
     pd.DataFrame(
@@ -202,7 +321,7 @@ def test_stable_resume_manifest_mismatch_is_rejected(tmp_path, key: str) -> None
     train_identity, validation_identity = _parquet_identities(tmp_path)
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
-    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 4}), encoding="utf-8")
+    _write_trainer_state(checkpoint)
     stored = _stable_manifest(train_identity, validation_identity)
     current = dict(stored)
     current[key] = "different"
@@ -217,7 +336,7 @@ def test_legacy_manifest_allows_hf_fingerprint_change_only_with_persisted_metada
     train_identity, validation_identity = _parquet_identities(tmp_path)
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
-    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 4}), encoding="utf-8")
+    _write_trainer_state(checkpoint)
     current = _stable_manifest(train_identity, validation_identity)
     legacy = {
         key: value

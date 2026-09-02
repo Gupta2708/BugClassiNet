@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -37,6 +38,11 @@ _CHECKPOINT_MODEL_FILES = (
     "pytorch_model.bin.index.json",
 )
 
+_LAYER_NORM_KEY_RENAMES = (
+    (".LayerNorm.gamma", ".LayerNorm.weight", "gamma_to_weight"),
+    (".LayerNorm.beta", ".LayerNorm.bias", "beta_to_bias"),
+)
+
 
 def _package_version(distribution: str) -> str:
     try:
@@ -56,6 +62,154 @@ def _source_path(value: Any) -> str | None:
 
 def _dataset_fingerprint(dataset: Any) -> str:
     return str(getattr(dataset, "_fingerprint", f"rows-{len(dataset)}"))
+
+
+def _is_floating_tensor(value: Any) -> bool:
+    predicate = getattr(value, "is_floating_point", None)
+    if callable(predicate):
+        return bool(predicate())
+    try:
+        return bool(np.issubdtype(value.dtype, np.floating))
+    except TypeError:
+        return False
+
+
+def _tensor_dtypes_compatible(source: Any, target: Any) -> bool:
+    return source.dtype == target.dtype or (
+        _is_floating_tensor(source) and _is_floating_tensor(target)
+    )
+
+
+def _remap_legacy_layer_norm_keys(
+    checkpoint_state: Mapping[str, Any], model_state: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Return a shallow state-dict copy with safe legacy DeBERTa LN key renames."""
+    remapped = dict(checkpoint_state)
+    counts = {name: 0 for _, _, name in _LAYER_NORM_KEY_RENAMES}
+    mapped_targets: set[str] = set()
+    for source_key in list(checkpoint_state):
+        for source_suffix, target_suffix, counter in _LAYER_NORM_KEY_RENAMES:
+            if not source_key.endswith(source_suffix):
+                continue
+            target_key = source_key.removesuffix(source_suffix) + target_suffix
+            if target_key not in model_state:
+                continue
+            if target_key in checkpoint_state or target_key in mapped_targets:
+                raise ValueError(
+                    "Legacy LayerNorm checkpoint remap collision: "
+                    f"source={source_key}, target={target_key}"
+                )
+            source_tensor = checkpoint_state[source_key]
+            target_tensor = model_state[target_key]
+            if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+                raise ValueError(
+                    "Legacy LayerNorm checkpoint shape mismatch: "
+                    f"source={source_key}{tuple(source_tensor.shape)}, "
+                    f"target={target_key}{tuple(target_tensor.shape)}"
+                )
+            if not _tensor_dtypes_compatible(source_tensor, target_tensor):
+                raise ValueError(
+                    "Legacy LayerNorm checkpoint dtype mismatch: "
+                    f"source={source_key} ({source_tensor.dtype}), "
+                    f"target={target_key} ({target_tensor.dtype})"
+                )
+            remapped[target_key] = remapped.pop(source_key)
+            mapped_targets.add(target_key)
+            counts[counter] += 1
+            break
+    return remapped, counts
+
+
+def _assert_strict_model_state_compatibility(
+    checkpoint_state: Mapping[str, Any], model_state: Mapping[str, Any]
+) -> None:
+    checkpoint_keys = set(checkpoint_state)
+    model_keys = set(model_state)
+    missing = sorted(model_keys - checkpoint_keys)
+    unexpected = sorted(checkpoint_keys - model_keys)
+    shape_mismatches = sorted(
+        key
+        for key in checkpoint_keys & model_keys
+        if tuple(checkpoint_state[key].shape) != tuple(model_state[key].shape)
+    )
+    if missing or unexpected or shape_mismatches:
+        raise ValueError(
+            "Strict checkpoint model-state compatibility failed: "
+            f"missing={missing}, unexpected={unexpected}, "
+            f"shape_mismatches={shape_mismatches}"
+        )
+
+
+def _load_checkpoint_model_state(checkpoint: Path, torch: Any) -> dict[str, Any]:
+    safe_weights = checkpoint / "model.safetensors"
+    pytorch_weights = checkpoint / "pytorch_model.bin"
+    if safe_weights.is_file():
+        from safetensors.torch import load_file
+
+        return load_file(str(safe_weights), device="cpu")
+    if pytorch_weights.is_file():
+        return torch.load(pytorch_weights, map_location="cpu", weights_only=True)
+    raise ValueError(
+        "Strict Stage-1 resume requires a single model.safetensors or pytorch_model.bin file; "
+        f"no supported model state was found in {checkpoint}"
+    )
+
+
+def _tensors_equal_after_restore(restored: Any, checkpoint: Any) -> bool:
+    if hasattr(restored, "detach"):
+        restored = restored.detach()
+    converter = getattr(checkpoint, "to", None)
+    if callable(converter):
+        checkpoint = converter(device=restored.device, dtype=restored.dtype)
+    comparator = getattr(restored, "equal", None)
+    if callable(comparator):
+        return bool(comparator(checkpoint))
+    return bool(np.array_equal(np.asarray(restored), np.asarray(checkpoint)))
+
+
+def _restore_checkpoint_model_state(model: Any, checkpoint: Path, torch: Any) -> dict[str, int]:
+    checkpoint_state = _load_checkpoint_model_state(checkpoint, torch)
+    model_state = model.state_dict()
+    checkpoint_state, counts = _remap_legacy_layer_norm_keys(checkpoint_state, model_state)
+    total = sum(counts.values())
+    LOGGER.info(
+        "Legacy LayerNorm checkpoint remap: gamma_to_weight=%d beta_to_bias=%d total_remapped=%d",
+        counts["gamma_to_weight"],
+        counts["beta_to_bias"],
+        total,
+    )
+    _assert_strict_model_state_compatibility(checkpoint_state, model_state)
+    model.load_state_dict(checkpoint_state, strict=True)
+
+    restored_state = model.state_dict()
+    classifier_keys = sorted(
+        key for key in model_state if key.startswith("classifier.") or ".classifier." in key
+    )
+    pooler_keys = sorted(
+        key for key in model_state if key.startswith("pooler.") or ".pooler." in key
+    )
+    if not classifier_keys or not pooler_keys:
+        raise ValueError(
+            "Strict checkpoint restore could not identify classifier and pooler parameters"
+        )
+    unrestored = [
+        key
+        for key in classifier_keys + pooler_keys
+        if not _tensors_equal_after_restore(restored_state[key], checkpoint_state[key])
+    ]
+    if unrestored:
+        raise ValueError(
+            f"Checkpoint classifier/pooler verification failed for parameters: {unrestored}"
+        )
+    LOGGER.info(
+        "Strict checkpoint model-state restore passed: missing=0 unexpected=0 "
+        "classifier_parameters_verified=%d pooler_parameters_verified=%d",
+        len(classifier_keys),
+        len(pooler_keys),
+    )
+    del restored_state, model_state, checkpoint_state
+    gc.collect()
+    return {**counts, "total_remapped": total}
 
 
 def _checksum_claims(path: Path) -> tuple[list[str], list[str]]:
@@ -151,7 +305,7 @@ def _require_resume_checkpoint(path: str | Path, use_fp16: bool) -> tuple[Path, 
 
 def _validate_resume_manifest(
     stored: dict[str, Any], current: dict[str, Any], checkpoint: Path
-) -> None:
+) -> dict[str, int | float]:
     stable_identity_available = bool(
         stored.get("train_source_sha256") and stored.get("validation_source_sha256")
     )
@@ -228,6 +382,31 @@ def _validate_resume_manifest(
             "Checkpoint global step disagrees with run_manifest.json: "
             f"trainer_state={checkpoint_step}, manifest={stored.get('ending_global_step')}"
         )
+    expected_steps = stored.get("expected_total_optimizer_steps")
+    state_max_steps = int(state.get("max_steps", -1))
+    if not isinstance(expected_steps, int) or expected_steps <= 0:
+        raise ValueError("Checkpoint manifest has no valid expected_total_optimizer_steps")
+    if state_max_steps != expected_steps:
+        raise ValueError(
+            "Checkpoint Trainer max_steps disagrees with run_manifest.json: "
+            f"trainer_state={state_max_steps}, manifest={expected_steps}"
+        )
+    try:
+        resumed_epoch = float(state["epoch"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Checkpoint trainer_state.json has no valid epoch") from error
+    LOGGER.info(
+        "Resume Trainer state verified: starting_global_step=%d "
+        "expected_total_optimizer_steps=%d resumed_epoch=%.10f",
+        checkpoint_step,
+        expected_steps,
+        resumed_epoch,
+    )
+    return {
+        "starting_global_step": checkpoint_step,
+        "expected_total_optimizer_steps": expected_steps,
+        "resumed_epoch": resumed_epoch,
+    }
 
 
 def _make_execution_callback(
@@ -621,6 +800,8 @@ def train_transformer(
     balanced_weights = _balanced_weights(labels, train_counts)
     weights_tensor = torch.tensor(balanced_weights, dtype=torch.float)
     class_weights = balanced_weights.tolist()
+    preloaded_resume_checkpoint: str | None = None
+    resume_state_summary: dict[str, int | float] | None = None
 
     class WeightedTrainer(Trainer):
         def compute_loss(
@@ -634,6 +815,19 @@ def train_transformer(
             loss = torch.nn.CrossEntropyLoss(weight=class_weights)(outputs.logits, labels_tensor)
             return (loss, outputs) if return_outputs else loss
 
+        def _load_from_checkpoint(self, resume_from_checkpoint: str, model: Any = None) -> None:
+            del model
+            requested = str(Path(resume_from_checkpoint).resolve())
+            if preloaded_resume_checkpoint is None or requested != preloaded_resume_checkpoint:
+                raise RuntimeError(
+                    "Checkpoint model state was not strictly restored before Trainer.train(): "
+                    f"requested={requested}, preloaded={preloaded_resume_checkpoint}"
+                )
+            LOGGER.info(
+                "Checkpoint model state was strictly restored before Trainer.train(): %s",
+                requested,
+            )
+
         def _save_checkpoint(self, model: Any, trial: Any) -> None:
             super()._save_checkpoint(model, trial)
             scaler = getattr(self.accelerator, "scaler", None)
@@ -643,6 +837,25 @@ def train_transformer(
 
         def _load_optimizer_and_scheduler(self, checkpoint: str | None) -> None:
             super()._load_optimizer_and_scheduler(checkpoint)
+            if checkpoint is not None:
+                if resume_state_summary is None:
+                    raise RuntimeError(
+                        "Resume state summary is unavailable after scheduler restore"
+                    )
+                expected_scheduler_step = int(resume_state_summary["starting_global_step"])
+                scheduler_step = int(getattr(self.lr_scheduler, "last_epoch", -1))
+                if scheduler_step != expected_scheduler_step:
+                    raise ValueError(
+                        "LR scheduler did not resume from the checkpoint global step: "
+                        f"scheduler_last_epoch={scheduler_step}, "
+                        f"checkpoint_global_step={expected_scheduler_step}"
+                    )
+                LOGGER.info(
+                    "Optimizer and LR scheduler restored: scheduler_last_epoch=%d "
+                    "checkpoint_global_step=%d",
+                    scheduler_step,
+                    expected_scheduler_step,
+                )
             scaler = getattr(self.accelerator, "scaler", None)
             if scaler is not None and checkpoint is not None:
                 scaler_state = torch.load(Path(checkpoint) / "scaler.pt", map_location="cpu")
@@ -746,11 +959,13 @@ def train_transformer(
     normalized_checkpoint = None
     if resume_from_checkpoint is not None:
         checkpoint, stored_manifest = _require_resume_checkpoint(resume_from_checkpoint, use_fp16)
-        _validate_resume_manifest(stored_manifest, manifest, checkpoint)
+        resume_state_summary = _validate_resume_manifest(stored_manifest, manifest, checkpoint)
         resumed_expected_steps = stored_manifest.get("expected_total_optimizer_steps")
         if not isinstance(resumed_expected_steps, int) or resumed_expected_steps <= 0:
             raise ValueError("Checkpoint manifest has no valid expected_total_optimizer_steps")
         normalized_checkpoint = str(checkpoint)
+        _restore_checkpoint_model_state(model, checkpoint, torch)
+        preloaded_resume_checkpoint = normalized_checkpoint
         manifest["resumed_checkpoint_path"] = normalized_checkpoint
 
     (destination / "training_config.json").write_text(
