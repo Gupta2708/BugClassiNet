@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from bugclassinet.data.transformer import (
     inspect_dataset,
@@ -21,10 +22,13 @@ from bugclassinet.data.transformer import (
 )
 from bugclassinet.evaluation.metrics import classification_metrics
 from bugclassinet.features.text import require_model_text
+from bugclassinet.utils.checksums import sha256_file
 from bugclassinet.utils.memory import log_memory
 from bugclassinet.utils.seed import set_seed
 
 LOGGER = logging.getLogger(__name__)
+
+_PREPROCESSING_VERSION = "nlbse2023-clean-parquet-v1"
 
 _CHECKPOINT_MODEL_FILES = (
     "model.safetensors",
@@ -52,6 +56,63 @@ def _source_path(value: Any) -> str | None:
 
 def _dataset_fingerprint(dataset: Any) -> str:
     return str(getattr(dataset, "_fingerprint", f"rows-{len(dataset)}"))
+
+
+def _checksum_claims(path: Path) -> tuple[list[str], list[str]]:
+    claims: list[str] = []
+    sources: list[str] = []
+    checksum_path = path.parent / "checksums.json"
+    if checksum_path.is_file():
+        checksums = json.loads(checksum_path.read_text(encoding="utf-8"))
+        value = checksums.get(path.name)
+        if value is not None:
+            claims.append(str(value).lower())
+            sources.append("checksums.json")
+
+    manifest_path = path.parent / "data_manifest.json"
+    if manifest_path.is_file():
+        data_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        value = data_manifest.get("processed_files", {}).get(path.name)
+        if value is not None:
+            claims.append(str(value).lower())
+            sources.append("data_manifest.json")
+    return claims, sources
+
+
+def _source_file_identity(path: str | Path, required_columns: list[str]) -> dict[str, Any]:
+    source = Path(path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Training source does not exist: {source}")
+    schema_columns = pq.read_schema(source).names
+    missing = sorted(set(required_columns) - set(schema_columns))
+    if missing:
+        raise ValueError(f"{source.name} is missing required columns: {missing}")
+
+    claims, provenance = _checksum_claims(source)
+    if len(set(claims)) > 1:
+        raise ValueError(
+            f"Checksum metadata disagrees for {source.name}: "
+            f"{dict(zip(provenance, claims, strict=True))}"
+        )
+    actual = sha256_file(source)
+    if claims and claims[0] != actual:
+        raise ValueError(
+            f"Source SHA-256 does not match published metadata for {source.name}: "
+            f"metadata={claims[0]}, actual={actual}"
+        )
+    LOGGER.info(
+        "Verified source identity file=%s sha256=%s checksum_provenance=%s",
+        source,
+        actual,
+        provenance or ["computed"],
+    )
+    return {
+        "path": str(source),
+        "sha256": actual,
+        "schema_columns": schema_columns,
+        "required_columns": required_columns,
+        "checksum_provenance": provenance or ["computed"],
+    }
 
 
 def _model_revision(tokenizer: Any) -> str:
@@ -91,11 +152,22 @@ def _require_resume_checkpoint(path: str | Path, use_fp16: bool) -> tuple[Path, 
 def _validate_resume_manifest(
     stored: dict[str, Any], current: dict[str, Any], checkpoint: Path
 ) -> None:
+    stable_identity_available = bool(
+        stored.get("train_source_sha256") and stored.get("validation_source_sha256")
+    )
     compared = (
-        "dataset_fingerprint",
-        "validation_fingerprint",
-        "training_rows",
+        "train_source_sha256",
+        "validation_source_sha256",
+        "train_rows",
         "validation_rows",
+        "train_class_counts",
+        "validation_class_counts",
+        "train_schema_columns",
+        "validation_schema_columns",
+        "train_required_columns",
+        "validation_required_columns",
+        "label_mapping_hash",
+        "preprocessing_version",
         "seed",
         "model_name",
         "model_revision",
@@ -105,6 +177,43 @@ def _validate_resume_manifest(
         "class_weights",
         "training_settings",
     )
+    if not stable_identity_available:
+        compared = (
+            "training_rows",
+            "validation_rows",
+            "seed",
+            "model_name",
+            "model_revision",
+            "config_hash",
+            "label_mapping",
+            "class_counts",
+            "class_weights",
+            "training_settings",
+        )
+        path_pairs = (
+            ("dataset_path", "train_checksum_provenance"),
+            ("validation_path", "validation_checksum_provenance"),
+        )
+        legacy_failures = []
+        for path_key, provenance_key in path_pairs:
+            if not stored.get(path_key) or stored.get(path_key) != current.get(path_key):
+                legacy_failures.append(f"{path_key} must exactly match the legacy checkpoint")
+            provenance = current.get(provenance_key, [])
+            if not provenance or provenance == ["computed"]:
+                legacy_failures.append(
+                    f"{path_key} requires checksums.json or data_manifest.json for legacy resume"
+                )
+        if legacy_failures:
+            raise ValueError(
+                "Legacy checkpoint cannot be verified against persistent source metadata: "
+                + "; ".join(legacy_failures)
+            )
+        LOGGER.warning(
+            "Accepting legacy checkpoint manifest without source SHA-256 because source paths "
+            "match exactly and current Parquet files were verified against persisted "
+            "checksum metadata"
+        )
+
     mismatches = [key for key in compared if stored.get(key) != current.get(key)]
     if mismatches:
         details = ", ".join(
@@ -446,6 +555,14 @@ def train_transformer(
     set_seed(config.seed)
     train_path = _source_path(train)
     validation_path = _source_path(validation)
+    train_source_identity = (
+        _source_file_identity(train_path, ["text", "canonical_label"]) if train_path else None
+    )
+    validation_source_identity = (
+        _source_file_identity(validation_path, ["issue_id", "text", "canonical_label"])
+        if validation_path
+        else None
+    )
     train, validation, preserve_validation_text = _load_inputs(
         train,
         validation,
@@ -464,6 +581,8 @@ def train_transformer(
     id_to_label = {index: label for label, index in label_to_id.items()}
     train_fingerprint = _dataset_fingerprint(train)
     validation_fingerprint = _dataset_fingerprint(validation)
+    train_schema_columns = list(train.column_names)
+    validation_schema_columns = list(validation.column_names)
     LOGGER.info("Stage-1 training class counts=%s", train_counts)
     LOGGER.info("Stage-1 validation class counts=%s", validation_counts)
 
@@ -576,16 +695,45 @@ def train_transformer(
     manifest: dict[str, Any] = {
         "dataset_path": train_path,
         "dataset_fingerprint": train_fingerprint,
+        "train_hf_fingerprint": train_fingerprint,
+        "train_source_sha256": (train_source_identity["sha256"] if train_source_identity else None),
         "validation_path": validation_path,
         "validation_fingerprint": validation_fingerprint,
+        "validation_hf_fingerprint": validation_fingerprint,
+        "validation_source_sha256": (
+            validation_source_identity["sha256"] if validation_source_identity else None
+        ),
         "training_rows": len(tokenized_train),
+        "train_rows": len(tokenized_train),
         "validation_rows": len(tokenized_validation),
+        "train_class_counts": train_counts,
+        "validation_class_counts": validation_counts,
+        "class_counts": train_counts,
+        "train_schema_columns": (
+            train_source_identity["schema_columns"]
+            if train_source_identity
+            else train_schema_columns
+        ),
+        "validation_schema_columns": (
+            validation_source_identity["schema_columns"]
+            if validation_source_identity
+            else validation_schema_columns
+        ),
+        "train_required_columns": ["text", "canonical_label"],
+        "validation_required_columns": ["issue_id", "text", "canonical_label"],
+        "train_checksum_provenance": (
+            train_source_identity["checksum_provenance"] if train_source_identity else []
+        ),
+        "validation_checksum_provenance": (
+            validation_source_identity["checksum_provenance"] if validation_source_identity else []
+        ),
+        "preprocessing_version": _PREPROCESSING_VERSION,
         "seed": config.seed,
         "model_name": config.model_name,
         "model_revision": revision,
         "config_hash": _json_hash(config_for_hash),
         "label_mapping": label_to_id,
-        "class_counts": train_counts,
+        "label_mapping_hash": _json_hash(label_to_id),
         "class_weights": class_weights,
         "training_settings": training_settings,
         "expected_total_optimizer_steps": None,

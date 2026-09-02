@@ -60,9 +60,13 @@ full checkpoint and graceful stop without changing the one-epoch Trainer plan
 or learning-rate schedule. Intermediate segments skip validation with
 `--skip-final-evaluation`; the resumed final segment runs the complete
 validation split. Resume with `--resume-from-checkpoint /path/to/checkpoint-N`.
-The checkpoint manifest rejects changes to the dataset, label mapping, model
-revision, seed, device count, precision, or training configuration, and Trainer
-data skipping remains enabled so completed batches are not replayed.
+The checkpoint manifest identifies persisted Parquet inputs by verified SHA-256,
+row/class counts, schema, preprocessing version, and label-mapping hash. Hugging
+Face/Arrow fingerprints are retained only for diagnostics because they can vary
+between sessions. Resume still rejects changes to the dataset, label mapping,
+model revision, seed, device count, precision, optimizer-step horizon, or training
+configuration, and Trainer data skipping remains enabled so completed batches
+are not replayed.
 
 ## Full-scale TF-IDF
 
