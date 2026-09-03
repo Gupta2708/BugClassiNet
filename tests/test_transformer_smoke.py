@@ -335,5 +335,6 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
     assert validation_metrics["accuracy"] == 1.0
     manifest = pd.read_json(tmp_path / "run_manifest.json", typ="series")
     assert manifest["class_weight_strategy"] == "balanced"
+    assert manifest["class_weight_exponent"] == 1.0
     assert manifest["train_sample_rows"] == 4
     assert len(manifest["train_sample_fingerprint"]) == 64

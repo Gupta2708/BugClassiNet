@@ -49,6 +49,20 @@ def test_sqrt_balanced_is_exact_square_root_of_balanced() -> None:
     np.testing.assert_allclose(sqrt_balanced, np.sqrt(balanced))
 
 
+def test_quarter_balanced_is_exact_fourth_root_of_balanced() -> None:
+    labels = ["BUG", "DOCUMENTATION", "ENHANCEMENT", "QUESTION"]
+    counts = {
+        "BUG": 579_398,
+        "DOCUMENTATION": 48_664,
+        "ENHANCEMENT": 394_835,
+        "QUESTION": 66_797,
+    }
+    balanced = _resolve_class_weights(labels, counts, "balanced")
+    quarter_balanced = _resolve_class_weights(labels, counts, "quarter_balanced")
+
+    np.testing.assert_allclose(quarter_balanced, np.power(balanced, 0.25))
+
+
 def test_none_returns_unweighted_cross_entropy_marker() -> None:
     assert _resolve_class_weights(["BUG", "QUESTION"], {"BUG": 8, "QUESTION": 2}, "none") is None
 
@@ -76,6 +90,7 @@ def test_200k_ablation_configs_change_only_weight_strategy() -> None:
     config_dir = Path("configs/models")
     names = {
         "balanced": "deberta_stage1_200k_balanced_256.yaml",
+        "quarter_balanced": "deberta_stage1_200k_quarter_balanced_256.yaml",
         "sqrt_balanced": "deberta_stage1_200k_sqrt_balanced_256.yaml",
         "none": "deberta_stage1_200k_unweighted_256.yaml",
     }

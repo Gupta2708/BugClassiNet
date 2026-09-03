@@ -46,6 +46,13 @@ _LAYER_NORM_KEY_RENAMES = (
     (".LayerNorm.beta", ".LayerNorm.bias", "beta_to_bias"),
 )
 
+_CLASS_WEIGHT_EXPONENTS = {
+    "none": 0.0,
+    "quarter_balanced": 0.25,
+    "sqrt_balanced": 0.5,
+    "balanced": 1.0,
+}
+
 
 def _package_version(distribution: str) -> str:
     try:
@@ -377,6 +384,7 @@ def _validate_resume_manifest(
         "train_sample_seed",
         "train_sample_limit",
         "class_weight_strategy",
+        "class_weight_exponent",
         "class_weights_by_label",
         "class_weight_ratios_to_bug",
         "cross_entropy_weighted",
@@ -532,7 +540,7 @@ class TransformerTrainingConfig:
     class_weights: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
-        supported = {"balanced", "sqrt_balanced", "none", "custom"}
+        supported = {*_CLASS_WEIGHT_EXPONENTS, "custom"}
         if self.class_weight_strategy not in supported:
             raise ValueError(
                 f"Invalid class_weight_strategy={self.class_weight_strategy!r}; "
@@ -729,6 +737,8 @@ def _resolve_class_weights(
     balanced = _balanced_weights(labels, counts)
     if strategy == "balanced":
         return balanced
+    if strategy == "quarter_balanced":
+        return np.power(balanced, 0.25)
     if strategy == "sqrt_balanced":
         return np.sqrt(balanced)
     if strategy == "none":
@@ -892,9 +902,10 @@ def train_transformer(
         label: weight / bug_weight for label, weight in class_weights_by_label.items()
     }
     LOGGER.info(
-        "Stage-1 loss class_weight_strategy=%s class_counts=%s class_weights=%s "
-        "weight_ratios_to_bug=%s",
+        "Stage-1 loss class_weight_strategy=%s class_weight_exponent=%s class_counts=%s "
+        "class_weights=%s weight_ratios_to_bug=%s",
         config.class_weight_strategy,
+        _CLASS_WEIGHT_EXPONENTS.get(config.class_weight_strategy),
         train_counts,
         class_weights_by_label,
         weight_ratios_to_bug,
@@ -1064,6 +1075,7 @@ def train_transformer(
         "class_weights_by_label": class_weights_by_label,
         "class_weight_ratios_to_bug": weight_ratios_to_bug,
         "class_weight_strategy": config.class_weight_strategy,
+        "class_weight_exponent": _CLASS_WEIGHT_EXPONENTS.get(config.class_weight_strategy),
         "cross_entropy_weighted": selected_weights is not None,
         "cross_entropy_class_weights": (
             None if selected_weights is None else selected_weights.tolist()

@@ -75,15 +75,17 @@ resulting sequence-classification state is strictly complete, including the
 classifier and pooler.
 
 Stage-1 class weighting is controlled by `class_weight_strategy`: `balanced`
-(the backward-compatible default), `sqrt_balanced`, `none`, or `custom` with an
-explicit `class_weights` mapping. The 200K/256-token ablation presets share all
-other hyperparameters and must be run with `--max-train-samples 200000`; each
-manifest records the ordered sample fingerprint. The final validation uses one
-`Trainer.predict` pass to produce aggregate and per-class scores, a fixed-order
-confusion matrix, true/predicted counts, a full classification report, and
-row-level logits/probabilities under `evaluation/`. Existing final models and
-checkpoints can be reported without retraining via `evaluate-stage1 --model
-MODEL_DIR --data validation_clean.parquet --output-dir OUTPUT_DIR`.
+(the backward-compatible default), `sqrt_balanced`, `quarter_balanced`, `none`,
+or `custom` with an explicit `class_weights` mapping. These correspond to
+balanced-weight exponents 1, 0.5, 0.25, and 0 respectively (custom weights have
+no exponent). The 200K/256-token ablation presets share all other hyperparameters
+and must be run with `--max-train-samples 200000`; each manifest records the
+ordered sample fingerprint, resolved weights, and exponent. The final validation
+uses one `Trainer.predict` pass to produce aggregate and per-class scores, a
+fixed-order confusion matrix, true/predicted counts, a full classification
+report, and row-level logits/probabilities under `evaluation/`. Existing final
+models and checkpoints can be reported without retraining via `evaluate-stage1
+--model MODEL_DIR --data validation_clean.parquet --output-dir OUTPUT_DIR`.
 
 ## Full-scale TF-IDF
 
