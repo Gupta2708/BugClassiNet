@@ -10,6 +10,7 @@ import pandas as pd
 
 from bugclassinet.evaluation.evaluate import evaluate_classifier
 from bugclassinet.evaluation.hierarchy import evaluate_hierarchy as hierarchy_metrics
+from bugclassinet.evaluation.stage1 import evaluate_saved_stage1
 from bugclassinet.models.tfidf_classifier import load_tfidf
 from bugclassinet.training import train_dapt as dapt
 from bugclassinet.training import train_stage1 as stage1
@@ -91,11 +92,15 @@ def train_dapt(args: Any) -> None:
 
 def evaluate_stage1(args: Any) -> None:
     if not args.model_path or not args.test:
-        raise ValueError("evaluate-stage1 requires --model-path and --test")
-    metrics = evaluate_classifier(
-        load_tfidf(args.model_path), pd.read_parquet(args.test), args.output_dir
-    )
-    _print(metrics)
+        raise ValueError("evaluate-stage1 requires --model/--model-path and --data/--test")
+    model_path = Path(args.model_path)
+    if model_path.is_file():
+        result = evaluate_classifier(
+            load_tfidf(model_path), pd.read_parquet(args.test), args.output_dir
+        )
+    else:
+        result = evaluate_saved_stage1(model_path, args.test, args.output_dir)
+    _print(result)
 
 
 def evaluate_hierarchy(args: Any) -> None:

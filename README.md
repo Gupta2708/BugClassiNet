@@ -12,7 +12,7 @@ python -m venv .venv
 python -m bugclassinet.cli inspect-archive data/raw/nlbse2023/train.tar.gz
 python -m bugclassinet.cli prepare-nlbse --train-archive TRAIN.tar.gz --test-archive TEST.tar.gz
 python -m bugclassinet.cli train-tfidf --data-dir data/processed/nlbse2023 --output-dir outputs/models/tfidf
-python -m bugclassinet.cli evaluate-stage1 --model-path outputs/models/tfidf/model.joblib --test data/processed/nlbse2023/test.parquet
+python -m bugclassinet.cli evaluate-stage1 --model outputs/models/deberta_stage1 --data data/processed/nlbse2023/validation_clean.parquet --output-dir outputs/evaluations/deberta_stage1
 ```
 
 Install Transformer dependencies only in environments that train DeBERTa,
@@ -78,9 +78,12 @@ Stage-1 class weighting is controlled by `class_weight_strategy`: `balanced`
 (the backward-compatible default), `sqrt_balanced`, `none`, or `custom` with an
 explicit `class_weights` mapping. The 200K/256-token ablation presets share all
 other hyperparameters and must be run with `--max-train-samples 200000`; each
-manifest records the ordered sample fingerprint. Validation metrics include
-all aggregate and per-class scores plus the confusion matrix, while validation
-predictions retain true/predicted labels and one logit column per class.
+manifest records the ordered sample fingerprint. The final validation uses one
+`Trainer.predict` pass to produce aggregate and per-class scores, a fixed-order
+confusion matrix, true/predicted counts, a full classification report, and
+row-level logits/probabilities under `evaluation/`. Existing final models and
+checkpoints can be reported without retraining via `evaluate-stage1 --model
+MODEL_DIR --data validation_clean.parquet --output-dir OUTPUT_DIR`.
 
 ## Full-scale TF-IDF
 

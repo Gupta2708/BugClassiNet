@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 import logging
+import shutil
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -23,6 +24,7 @@ from bugclassinet.data.transformer import (
     stratified_limit,
 )
 from bugclassinet.evaluation.metrics import classification_metrics
+from bugclassinet.evaluation.reporting import write_stage1_evaluation
 from bugclassinet.features.text import require_model_text
 from bugclassinet.utils.checksums import sha256_file
 from bugclassinet.utils.memory import log_memory
@@ -1162,11 +1164,12 @@ def train_transformer(
     del tokenized_train
     gc.collect()
     log_memory(LOGGER, "before evaluation", validation_rows=len(tokenized_validation))
-    metrics = trainer.evaluate()
     trainer.save_model(destination)
     tokenizer.save_pretrained(destination)
 
-    # Reuse the exact evaluation token table; do not tokenize validation twice.
+    # One prediction pass supplies loss, logits, labels, aggregate metrics, and
+    # every detailed report. Never precede this with Trainer.evaluate(): that
+    # would run the complete validation loader a second time.
     prediction = trainer.predict(tokenized_validation)
     logits = np.asarray(prediction.predictions)
     if logits.ndim != 2 or logits.shape != (len(tokenized_validation), len(labels)):
@@ -1176,20 +1179,40 @@ def train_transformer(
         )
     predicted_labels = [id_to_label[int(value)] for value in np.argmax(logits, axis=1)]
     true_labels = list(validation_metadata["canonical_label"])
-    full_metrics = classification_metrics(true_labels, predicted_labels)
+    prediction_metrics = dict(getattr(prediction, "metrics", {}) or {})
+    eval_loss = prediction_metrics.get("test_loss")
+    detailed_metrics = write_stage1_evaluation(
+        destination / "evaluation",
+        true_labels,
+        predicted_labels,
+        label_to_id,
+        eval_loss=float(eval_loss) if eval_loss is not None else None,
+        logits=logits,
+        score_label_order=labels,
+        issue_ids=(
+            list(validation_metadata["issue_id"])
+            if "issue_id" in validation_metadata.column_names
+            else None
+        ),
+    )
+    metrics = {
+        (f"eval_{key.removeprefix('test_')}" if key.startswith("test_") else key): value
+        for key, value in prediction_metrics.items()
+    }
+    for key in (
+        "accuracy",
+        "macro_f1",
+        "micro_f1",
+        "weighted_f1",
+        "mcc",
+        "balanced_accuracy",
+    ):
+        metrics[f"eval_{key}"] = detailed_metrics[key]
     validation_metrics = {
-        "eval_loss": float(metrics["eval_loss"]),
-        "accuracy": full_metrics["accuracy"],
-        "macro_f1": full_metrics["macro_f1"],
-        "micro_f1": full_metrics["micro_f1"],
-        "weighted_f1": full_metrics["weighted_f1"],
-        "mcc": full_metrics["mcc"],
-        "balanced_accuracy": full_metrics["balanced_accuracy"],
-        "labels": full_metrics["labels"],
-        "per_class": {label: full_metrics["per_class"][label] for label in full_metrics["labels"]},
+        **detailed_metrics,
         "confusion_matrix": {
-            "labels": full_metrics["labels"],
-            "matrix": full_metrics["confusion_matrix"],
+            "labels": detailed_metrics["labels"],
+            "matrix": detailed_metrics["confusion_matrix"],
         },
     }
     (destination / "validation_metrics.json").write_text(
@@ -1197,13 +1220,11 @@ def train_transformer(
         encoding="utf-8",
     )
 
-    prediction_rows = validation_metadata.add_column("true_label", true_labels)
-    prediction_rows = prediction_rows.add_column("predicted_label", predicted_labels)
-    prediction_rows = prediction_rows.add_column("prediction", predicted_labels)
-    float_logits = logits.astype(np.float32, copy=False)
-    for index, label in enumerate(labels):
-        prediction_rows = prediction_rows.add_column(f"logit_{label}", float_logits[:, index])
-    prediction_rows.to_parquet(str(destination / "validation_predictions.parquet"))
+    # Retain the legacy root-level filenames without another inference pass.
+    shutil.copyfile(
+        destination / "evaluation" / "predictions.parquet",
+        destination / "validation_predictions.parquet",
+    )
     manifest["status"] = "completed"
     _write_run_manifest(destination / "run_manifest.json", manifest)
     return metrics

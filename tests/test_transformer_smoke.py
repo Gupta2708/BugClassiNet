@@ -154,14 +154,18 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
             return None
 
         def evaluate(self):
-            return {"eval_loss": 0.25, "eval_macro_f1": 1.0}
+            raise AssertionError("Stage-1 completion must not run a second inference pass")
 
         def save_model(self, output):
             return None
 
         def predict(self, dataset):
             created["predict_dataset"] = dataset
-            return SimpleNamespace(predictions=np.array([[1.0, 0.0], [0.0, 1.0]]))
+            created["predict_calls"] = int(created.get("predict_calls", 0)) + 1
+            return SimpleNamespace(
+                predictions=np.eye(4),
+                metrics={"test_loss": 0.25, "test_runtime": 1.0},
+            )
 
     created: dict[str, object] = {}
 
@@ -215,6 +219,8 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
         [
             {"text": "bug", "canonical_label": "BUG"},
             {"text": "docs", "canonical_label": "DOCUMENTATION"},
+            {"text": "enhancement", "canonical_label": "ENHANCEMENT"},
+            {"text": "question", "canonical_label": "QUESTION"},
         ],
         fingerprint="train",
     )
@@ -231,6 +237,18 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
                 "project": "beta",
                 "text": "docs",
                 "canonical_label": "DOCUMENTATION",
+            },
+            {
+                "issue_id": "v3",
+                "project": "gamma",
+                "text": "enhancement",
+                "canonical_label": "ENHANCEMENT",
+            },
+            {
+                "issue_id": "v4",
+                "project": "delta",
+                "text": "question",
+                "canonical_label": "QUESTION",
             },
         ],
         fingerprint="validation",
@@ -277,6 +295,7 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
         "return_tensors": "pt",
     }
     assert created["predict_dataset"] is created["eval_dataset"]
+    assert created["predict_calls"] == 1
     assert len(FakeDataset.map_calls) == 2
     assert all(call["batched"] is True for call in FakeDataset.map_calls)
     assert all(call["batch_size"] == 512 for call in FakeDataset.map_calls)
@@ -292,18 +311,29 @@ def test_stage1_trainer_uses_memory_safe_tokenization(
     predictions = pd.read_parquet(tmp_path / "validation_predictions.parquet")
     assert predictions.columns.tolist() == [
         "issue_id",
-        "project",
-        "canonical_label",
         "true_label",
         "predicted_label",
-        "prediction",
+        "true_label_id",
+        "predicted_label_id",
         "logit_BUG",
         "logit_DOCUMENTATION",
+        "logit_ENHANCEMENT",
+        "logit_QUESTION",
+        "probability_BUG",
+        "probability_DOCUMENTATION",
+        "probability_ENHANCEMENT",
+        "probability_QUESTION",
     ]
+    assert (tmp_path / "evaluation" / "metrics.json").is_file()
+    assert (tmp_path / "evaluation" / "per_class_metrics.csv").is_file()
+    assert (tmp_path / "evaluation" / "confusion_matrix.csv").is_file()
+    assert (tmp_path / "evaluation" / "classification_report.csv").is_file()
+    assert (tmp_path / "evaluation" / "prediction_counts.csv").is_file()
+    assert (tmp_path / "evaluation" / "predictions.parquet").is_file()
     validation_metrics = pd.read_json(tmp_path / "validation_metrics.json", typ="series")
     assert validation_metrics["eval_loss"] == 0.25
     assert validation_metrics["accuracy"] == 1.0
     manifest = pd.read_json(tmp_path / "run_manifest.json", typ="series")
     assert manifest["class_weight_strategy"] == "balanced"
-    assert manifest["train_sample_rows"] == 2
+    assert manifest["train_sample_rows"] == 4
     assert len(manifest["train_sample_fingerprint"]) == 64

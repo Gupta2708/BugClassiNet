@@ -9,9 +9,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from bugclassinet.evaluation.metrics import classification_metrics
+from bugclassinet.evaluation.reporting import STAGE1_REPORT_LABELS, write_stage1_evaluation
 from bugclassinet.features.text import require_model_text
-from bugclassinet.utils.io import write_json
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,11 +35,13 @@ def evaluate_classifier(
     if "canonical_label" not in frame:
         raise ValueError("Evaluation requires canonical_label")
     predictions = predict_in_batches(model, require_model_text(frame), prediction_batch_size)
-    metrics = classification_metrics(frame["canonical_label"].tolist(), list(predictions))
     target = Path(output_dir)
     target.mkdir(parents=True, exist_ok=True)
-    write_json(target / "metrics.json", metrics)
-    rows = frame.copy()
-    rows["prediction"] = predictions
-    rows.to_parquet(target / "predictions.parquet", index=False)
-    return metrics
+    label_to_id = {label: index for index, label in enumerate(STAGE1_REPORT_LABELS)}
+    return write_stage1_evaluation(
+        target,
+        frame["canonical_label"].tolist(),
+        list(predictions),
+        label_to_id,
+        issue_ids=frame["issue_id"].tolist() if "issue_id" in frame else None,
+    )
