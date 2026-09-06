@@ -128,6 +128,13 @@ def write_stage1_evaluation(
     )
     full_report = _classification_report_frame(report)
 
+    metrics["true_class_counts"] = dict(
+        zip(STAGE1_REPORT_LABELS, counts["true_count"].tolist(), strict=True)
+    )
+    metrics["predicted_class_counts"] = dict(
+        zip(STAGE1_REPORT_LABELS, counts["predicted_count"].tolist(), strict=True)
+    )
+
     target = Path(output_dir)
     target.mkdir(parents=True, exist_ok=True)
     write_json(target / "metrics.json", metrics)

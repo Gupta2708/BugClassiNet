@@ -55,6 +55,13 @@ def test_stage1_report_has_fixed_order_correct_metrics_and_artifacts(tmp_path, c
         "balanced_accuracy",
     ):
         assert saved_metrics[name] == pytest.approx(metrics[name])
+    assert saved_metrics["true_class_counts"] == {
+        "BUG": 2,
+        "DOCUMENTATION": 1,
+        "ENHANCEMENT": 1,
+        "QUESTION": 1,
+    }
+    assert sum(saved_metrics["predicted_class_counts"].values()) == len(truth)
 
     per_class = pd.read_csv(tmp_path / "per_class_metrics.csv")
     assert per_class["class"].tolist() == list(STAGE1_REPORT_LABELS)

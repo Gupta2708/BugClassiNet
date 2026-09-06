@@ -86,6 +86,16 @@ fixed-order confusion matrix, true/predicted counts, a full classification
 report, and row-level logits/probabilities under `evaluation/`. Existing final
 models and checkpoints can be reported without retraining via `evaluate-stage1
 --model MODEL_DIR --data validation_clean.parquet --output-dir OUTPUT_DIR`.
+The standalone evaluator disables `Trainer.train`, applies ordinary argmax to
+unweighted model logits, and verifies a before/after hash of every model
+parameter. It writes its reports directly into `OUTPUT_DIR`, including an
+`evaluation_manifest.json` with checkpoint, training-config, model-revision,
+and evaluated-dataset identities. Use the frozen model on the official test set
+only after validation-based model selection is complete:
+
+```powershell
+python -m bugclassinet.cli evaluate-stage1 --model FINAL_CHECKPOINT --data data/processed/nlbse2023/test.parquet --output-dir outputs/evaluation/stage1_final_test
+```
 
 ## Full-scale TF-IDF
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +15,126 @@ import pyarrow.parquet as pq
 
 from bugclassinet.data.transformer import inspect_dataset, load_parquet_dataset
 from bugclassinet.evaluation.reporting import STAGE1_REPORT_LABELS, write_stage1_evaluation
+from bugclassinet.utils.checksums import sha256_file
+from bugclassinet.utils.io import write_json
 from bugclassinet.utils.memory import log_memory
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _checkpoint_model_sha256(model_dir: Path) -> str:
+    """Hash the persisted model files that define the frozen checkpoint."""
+    candidates = sorted(model_dir.glob("model*.safetensors"))
+    if not candidates:
+        candidates = sorted(model_dir.glob("pytorch_model*.bin"))
+    if not candidates:
+        raise ValueError(f"No persisted model weights found in {model_dir}")
+    digest = hashlib.sha256()
+    for path in candidates:
+        encoded_name = path.name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _model_parameter_sha256(model: Any, torch: Any) -> str:
+    """Hash all named parameters without retaining a second model copy."""
+    digest = hashlib.sha256()
+    for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
+        value = parameter.detach().contiguous().cpu()
+        encoded_name = name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(json.dumps(list(value.shape)).encode("ascii"))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+        del value
+    return digest.hexdigest()
+
+
+def _assert_parameters_unchanged(before: str, after: str) -> None:
+    if after != before:
+        raise RuntimeError(
+            "Frozen Stage-1 model parameters changed during evaluation: "
+            f"before={before}, after={after}"
+        )
+
+
+def _evaluation_only_trainer_class(trainer_base: type) -> type:
+    class EvaluationOnlyTrainer(trainer_base):
+        def train(self, *_: Any, **__: Any) -> Any:
+            raise RuntimeError("Training is disabled in the Stage-1 evaluation-only path")
+
+    return EvaluationOnlyTrainer
+
+
+def _build_evaluation_manifest(
+    *,
+    checkpoint_path: Path,
+    checkpoint_hash: str,
+    parameter_hash_before: str,
+    parameter_hash_after: str,
+    model_name: str | None,
+    model_revision: str,
+    config_hash: str,
+    test_path: Path,
+    test_hash: str,
+    label_mapping: dict[str, int],
+    max_length: int,
+    preprocessing_version: str | None,
+    tokenizer_source: str,
+    ending_global_step: int,
+    rows: int,
+) -> dict[str, Any]:
+    _assert_parameters_unchanged(parameter_hash_before, parameter_hash_after)
+    return {
+        "final_checkpoint_path": str(checkpoint_path),
+        "final_checkpoint_sha256": checkpoint_hash,
+        "model_parameter_sha256_before": parameter_hash_before,
+        "model_parameter_sha256_after": parameter_hash_after,
+        "model_parameters_unchanged": True,
+        "training_invoked": False,
+        "inference_method": "Trainer.predict with ordinary argmax",
+        "class_weights_used_for_inference": False,
+        "model_name": model_name,
+        "model_revision": model_revision,
+        "config_hash": config_hash,
+        "test_dataset_path": str(test_path),
+        "test_dataset_sha256": test_hash,
+        "label_mapping": label_mapping,
+        "max_length": max_length,
+        "preprocessing_version": preprocessing_version,
+        "text_column": "text",
+        "tokenizer_source": tokenizer_source,
+        "ending_global_step": ending_global_step,
+        "rows": rows,
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _validate_complete_checkpoint(manifest: dict[str, Any], checkpoint: Path) -> int:
+    try:
+        ending_step = int(manifest["ending_global_step"])
+        expected_steps = int(manifest["expected_total_optimizer_steps"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Saved run manifest has no valid final optimizer-step identity") from error
+    if ending_step <= 0 or ending_step != expected_steps:
+        raise ValueError(
+            "Official-test evaluation requires the completed final checkpoint: "
+            f"ending_global_step={ending_step}, expected_total_optimizer_steps={expected_steps}"
+        )
+    state_path = checkpoint / "trainer_state.json"
+    if state_path.is_file():
+        state_step = int(json.loads(state_path.read_text(encoding="utf-8"))["global_step"])
+        if state_step != ending_step:
+            raise ValueError(
+                "Checkpoint trainer state disagrees with its run manifest: "
+                f"trainer_state={state_step}, manifest={ending_step}"
+            )
+    return ending_step
 
 
 def _load_manifest(model_dir: Path) -> dict[str, Any]:
@@ -86,13 +205,24 @@ def evaluate_saved_stage1(
     if not data.is_file():
         raise FileNotFoundError(f"Stage-1 evaluation data does not exist: {data}")
     destination.mkdir(parents=True, exist_ok=True)
+    test_dataset_hash = sha256_file(data)
 
     manifest = _load_manifest(source)
+    ending_global_step = _validate_complete_checkpoint(manifest, source)
+    model_revision = manifest.get("model_revision")
+    config_hash = manifest.get("config_hash")
+    if not model_revision or not config_hash:
+        raise ValueError(
+            "Official-test evaluation requires model_revision and config_hash "
+            "in the saved run_manifest.json"
+        )
     model_config = AutoConfig.from_pretrained(source)
     label_to_id = _label_mapping(model_config, manifest)
     id_to_label = {index: label for label, index in label_to_id.items()}
     model = AutoModelForSequenceClassification.from_config(model_config)
     _restore_checkpoint_model_state(model, source, torch)
+    parameter_hash_before = _model_parameter_sha256(model, torch)
+    checkpoint_hash = _checkpoint_model_sha256(source)
 
     tokenizer_source: str | Path = source
     if not (source / "tokenizer_config.json").is_file():
@@ -119,9 +249,12 @@ def evaluate_saved_stage1(
     if set(counts) - set(label_to_id):
         raise ValueError(f"Evaluation contains labels absent from the model: {counts}")
 
-    max_length = int(
-        manifest.get("max_length") or manifest.get("training_settings", {}).get("max_length") or 256
+    stored_max_length = manifest.get("max_length") or manifest.get("training_settings", {}).get(
+        "max_length"
     )
+    if stored_max_length is None:
+        raise ValueError("Saved run manifest does not record the training max_length")
+    max_length = int(stored_max_length)
     training_config = TransformerTrainingConfig(
         model_name=str(manifest.get("model_name", getattr(model_config, "_name_or_path", source))),
         max_length=max_length,
@@ -141,43 +274,6 @@ def evaluate_saved_stage1(
     gc.collect()
     log_memory(LOGGER, "after standalone evaluation tokenization", validation_rows=len(tokenized))
 
-    if "cross_entropy_weighted" in manifest:
-        weighted = bool(manifest["cross_entropy_weighted"])
-        stored_weights = manifest.get("cross_entropy_class_weights")
-    elif "class_weights" in manifest:
-        # Manifests predating the explicit strategy field always used balanced
-        # cross-entropy and stored its ordered values as class_weights.
-        weighted = True
-        stored_weights = manifest.get("class_weights")
-    else:
-        weighted = False
-        stored_weights = None
-        LOGGER.warning(
-            "Saved model has no loss-weight manifest; standalone eval_loss will use "
-            "unweighted cross-entropy. Prediction-based metrics are unaffected."
-        )
-    if weighted and stored_weights is None:
-        raise ValueError("Saved weighted-loss model manifest has no class weights")
-    weights_tensor = (
-        torch.tensor(stored_weights, dtype=torch.float)
-        if weighted and stored_weights is not None
-        else None
-    )
-
-    class EvaluationTrainer(Trainer):
-        def compute_loss(
-            self, model: Any, inputs: dict[str, Any], return_outputs: bool = False, **_: Any
-        ) -> Any:
-            labels_tensor = inputs.pop("labels")
-            outputs = model(**inputs)
-            loss_weights = (
-                None
-                if weights_tensor is None
-                else weights_tensor.to(outputs.logits.device, dtype=outputs.logits.dtype)
-            )
-            loss = torch.nn.CrossEntropyLoss(weight=loss_weights)(outputs.logits, labels_tensor)
-            return (loss, outputs) if return_outputs else loss
-
     settings = manifest.get("training_settings", {})
     use_fp16 = bool(settings.get("fp16", False) and torch.cuda.is_available())
     arguments = TrainingArguments(
@@ -189,7 +285,8 @@ def evaluate_saved_stage1(
         dataloader_num_workers=0,
         dataloader_persistent_workers=False,
     )
-    trainer = EvaluationTrainer(
+    EvaluationOnlyTrainer = _evaluation_only_trainer_class(Trainer)
+    trainer = EvaluationOnlyTrainer(
         model=model,
         args=arguments,
         data_collator=DataCollatorWithPadding(
@@ -200,6 +297,12 @@ def evaluate_saved_stage1(
     )
     log_memory(LOGGER, "before standalone Trainer.predict", validation_rows=len(tokenized))
     prediction = trainer.predict(tokenized)
+    parameter_hash_after = _model_parameter_sha256(model, torch)
+    _assert_parameters_unchanged(parameter_hash_before, parameter_hash_after)
+    LOGGER.info(
+        "Evaluation-only parameter integrity verified sha256=%s training_invoked=false",
+        parameter_hash_after,
+    )
     logits = np.asarray(prediction.predictions)
     score_labels = [id_to_label[index] for index in range(len(id_to_label))]
     if logits.shape != (len(tokenized), len(score_labels)):
@@ -209,15 +312,31 @@ def evaluate_saved_stage1(
         )
     truth = list(metadata["canonical_label"])
     predicted = [id_to_label[int(index)] for index in np.argmax(logits, axis=1)]
-    prediction_metrics = dict(getattr(prediction, "metrics", {}) or {})
-    eval_loss = prediction_metrics.get("test_loss")
-    return write_stage1_evaluation(
-        destination / "evaluation",
+    metrics = write_stage1_evaluation(
+        destination,
         truth,
         predicted,
         label_to_id,
-        eval_loss=float(eval_loss) if eval_loss is not None else None,
         logits=logits,
         score_label_order=score_labels,
         issue_ids=list(metadata["issue_id"]) if "issue_id" in metadata.column_names else None,
     )
+    evaluation_manifest = _build_evaluation_manifest(
+        checkpoint_path=source,
+        checkpoint_hash=checkpoint_hash,
+        parameter_hash_before=parameter_hash_before,
+        parameter_hash_after=parameter_hash_after,
+        model_name=manifest.get("model_name", getattr(model_config, "_name_or_path", None)),
+        model_revision=str(model_revision),
+        config_hash=str(config_hash),
+        test_path=data,
+        test_hash=test_dataset_hash,
+        label_mapping=label_to_id,
+        max_length=max_length,
+        preprocessing_version=manifest.get("preprocessing_version"),
+        tokenizer_source=str(tokenizer_source),
+        ending_global_step=ending_global_step,
+        rows=len(tokenized),
+    )
+    write_json(destination / "evaluation_manifest.json", evaluation_manifest)
+    return metrics
