@@ -38,6 +38,13 @@ def normalised_text_hash(text: str) -> str:
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
+def construct_issue_text(title: object, body: object) -> str | pd.Series:
+    """Construct the exact Stage-1 model input from an issue title and body."""
+    if isinstance(title, pd.Series) and isinstance(body, pd.Series):
+        return "[TITLE]\n" + title + "\n\n[DESCRIPTION]\n" + body
+    return f"[TITLE]\n{clean_text(title)}\n\n[DESCRIPTION]\n{clean_text(body)}"
+
+
 def harmonize_issues(frame: pd.DataFrame, schema: IssueSchema) -> pd.DataFrame:
     """Preserve source data and append canonical fields required by the pipeline."""
     data = frame.copy()
@@ -48,7 +55,7 @@ def harmonize_issues(frame: pd.DataFrame, schema: IssueSchema) -> pd.DataFrame:
     title, body = title.loc[usable], body.loc[usable]
     data["title"] = title
     data["body"] = body
-    data["text"] = "[TITLE]\n" + title + "\n\n[DESCRIPTION]\n" + body
+    data["text"] = construct_issue_text(title, body)
     data["original_label"] = data[schema.original_label].map(clean_text)
     data["canonical_label"] = data["original_label"].map(canonicalize_stage1_label)
     unknown = sorted(data.loc[data["canonical_label"].isna(), "original_label"].unique())

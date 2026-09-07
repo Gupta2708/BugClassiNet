@@ -89,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
         "train-tfidf": "train_tfidf",
         "train-stage1": "train_stage1",
         "evaluate-stage1": "evaluate_stage1",
+        "evaluate-stage1-binary": "evaluate_stage1_binary",
+        "evaluate-nlbse2024": "evaluate_nlbse2024",
         "train-stage2": "train_stage2",
         "train-stage3": "train_stage3",
         "train-dapt": "train_dapt",
@@ -107,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--threshold", type=float, default=0.0)
         sub.add_argument("--max-train-samples", type=int)
         sub.add_argument("--max-eval-samples", type=int)
+        sub.add_argument("--batch-size", type=int)
         sub.add_argument("--max-steps", type=int)
         sub.add_argument("--stop-after-steps", type=int)
         sub.add_argument("--skip-final-evaluation", action="store_true")

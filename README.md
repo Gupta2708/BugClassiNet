@@ -97,6 +97,27 @@ only after validation-based model selection is complete:
 python -m bugclassinet.cli evaluate-stage1 --model FINAL_CHECKPOINT --data data/processed/nlbse2023/test.parquet --output-dir outputs/evaluation/stage1_final_test
 ```
 
+## Stage-1 Closeout Evaluation
+
+The selected Stage-1 model is frozen. `evaluate-stage1-binary` derives BUG versus
+NON_BUG decisions from the existing four-class logits; it does not train a binary
+model. Its probability threshold is selected only on NLBSE 2023 validation data
+and is then frozen for the official test evaluation.
+
+`evaluate-nlbse2024` reports the experiment **Frozen NLBSE 2023 -> NLBSE 2024
+cross-dataset transfer**. NLBSE 2024 `feature` maps to `ENHANCEMENT`; its ground
+truth has no `DOCUMENTATION` class. The command reports both untouched native
+four-output predictions (including out-of-taxonomy `DOCUMENTATION` predictions)
+and a clearly labeled post-hoc three-class probability projection. NLBSE 2024
+`issues_train.csv` is used only for schema inspection/audit, never for fitting,
+tuning, or calibration. This is not the official NLBSE 2024 competition protocol,
+which trains on that dataset's own training partition.
+
+```powershell
+python -m bugclassinet.cli evaluate-stage1-binary --model FINAL_CHECKPOINT --validation data/processed/nlbse2023/validation_clean.parquet --test data/processed/nlbse2023/test.parquet --output-dir outputs/evaluation/stage1_binary
+python -m bugclassinet.cli evaluate-nlbse2024 --model FINAL_CHECKPOINT --data data/raw/nlbse2024/issues_test.csv --output-dir outputs/evaluation/nlbse2024_transfer
+```
+
 ## Full-scale TF-IDF
 
 For million-row NLBSE training under constrained RAM, start with

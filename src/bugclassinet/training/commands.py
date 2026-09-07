@@ -8,8 +8,10 @@ from typing import Any
 
 import pandas as pd
 
+from bugclassinet.evaluation.binary import evaluate_stage1_binary as binary_evaluation
 from bugclassinet.evaluation.evaluate import evaluate_classifier
 from bugclassinet.evaluation.hierarchy import evaluate_hierarchy as hierarchy_metrics
+from bugclassinet.evaluation.nlbse2024 import evaluate_nlbse2024 as nlbse2024_evaluation
 from bugclassinet.evaluation.stage1 import evaluate_saved_stage1
 from bugclassinet.models.tfidf_classifier import load_tfidf
 from bugclassinet.training import train_dapt as dapt
@@ -101,6 +103,33 @@ def evaluate_stage1(args: Any) -> None:
     else:
         result = evaluate_saved_stage1(model_path, args.test, args.output_dir)
     _print(result)
+
+
+def evaluate_stage1_binary(args: Any) -> None:
+    if not args.model_path or not args.validation or not args.test:
+        raise ValueError("evaluate-stage1-binary requires --model, --validation, and --test")
+    _print(
+        binary_evaluation(
+            args.model_path,
+            args.validation,
+            args.test,
+            args.output_dir,
+            args.batch_size,
+        )
+    )
+
+
+def evaluate_nlbse2024(args: Any) -> None:
+    if not args.model_path or not args.test:
+        raise ValueError("evaluate-nlbse2024 requires --model and --data")
+    _print(
+        nlbse2024_evaluation(
+            args.model_path,
+            args.test,
+            args.output_dir,
+            args.batch_size,
+        )
+    )
 
 
 def evaluate_hierarchy(args: Any) -> None:
