@@ -51,6 +51,17 @@ APACHE_API_KEY_ENV = "BUGCLASSINET_APACHE_BUGZILLA_API_KEY"
 # 404. Use Bugzilla's native REST script entry point for this installation.
 APACHE_REST_ROOT = "https://bz.apache.org/bugzilla/rest.cgi"
 SAFE_TRACKER_METADATA = ("tracker_component", "tracker_operating_system", "tracker_platform")
+# Public Internet Archive. Used only as an explicit opt-in fallback when a
+# tracker refuses automated clients. The blocked origin is never contacted.
+WEB_ARCHIVE_HOST = "web.archive.org"
+WEB_ARCHIVE_CDX = "https://web.archive.org/cdx/search/cdx"
+# The "id_" modifier returns the archived bytes without Wayback's injected
+# banner and rewritten links, so the existing tracker parsers apply unchanged.
+WEB_ARCHIVE_SNAPSHOT = "https://web.archive.org/web/{timestamp}id_/{url}"
+WEB_ARCHIVE_PROJECTS = ("MySQL",)
+# A crawler can capture a login wall rather than the report, so a bounded walk
+# forward through successive captures is attempted before giving up on an issue.
+WEB_ARCHIVE_MAX_SNAPSHOTS = 8
 
 
 def tracker_url(project: str, bug_id: str) -> str:
@@ -185,10 +196,18 @@ def parse_bugzilla_rest(
 ) -> dict[str, Any]:
     """Parse documented Bugzilla bug/comment responses, excluding private comments."""
     bugs = bug_payload.get("bugs")
-    if not isinstance(bugs, list) or len(bugs) != 1 or str(bugs[0].get("id")) != expected_bug_id:
-        raise ValueError("Bugzilla bug response did not contain the requested issue")
+    if not isinstance(bugs, list) or len(bugs) != 1:
+        raise ValueError("Bugzilla bug response did not contain exactly one issue")
     bug = bugs[0]
-    comment_group = comments_payload.get("bugs", {}).get(expected_bug_id, {})
+    resolved_bug_id = string_value(bug.get("id")).strip()
+    if not resolved_bug_id:
+        raise ValueError("Bugzilla bug response carries no issue identifier")
+    # A requested id can be an alias of, or have been merged into, a different
+    # canonical issue. That is real evidence for the annotated bug, so keep it
+    # and record the substitution instead of discarding the report. Comments are
+    # keyed by the canonical id the server actually returned.
+    group = comments_payload.get("bugs", {})
+    comment_group = group.get(resolved_bug_id) or group.get(expected_bug_id) or {}
     comments = comment_group.get("comments")
     if not isinstance(comments, list):
         raise ValueError("Bugzilla comments response has an unexpected schema")
@@ -234,6 +253,8 @@ def parse_bugzilla_rest(
         "tracker_component": string_value(bug.get("component")),
         "tracker_operating_system": operating_system,
         "tracker_platform": platform,
+        "tracker_resolved_bug_id": resolved_bug_id,
+        "tracker_id_substituted": resolved_bug_id != expected_bug_id,
     }
 
 
@@ -270,12 +291,14 @@ class CachedRetriever:
         retries: int = 3,
         session: Any = None,
         sleeper: Any = time.sleep,
+        allow_web_archive: bool = False,
     ) -> None:
         if sleep_seconds < 0 or retries < 1:
             raise ValueError("sleep_seconds must be nonnegative and retries positive")
         self.cache = Path(cache_dir)
         self.cache.mkdir(parents=True, exist_ok=True)
         self.delay, self.retries = sleep_seconds, retries
+        self.allow_web_archive = allow_web_archive
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
         self.sleep = sleeper
@@ -300,6 +323,17 @@ class CachedRetriever:
             result = self._retrieve_httpd(bug_identifier(project, bug_id), url, token)
         else:
             result = self._retrieve_html(project, url, token)
+            if self.allow_web_archive and project in WEB_ARCHIVE_PROJECTS and not _usable(result):
+                archived = self._retrieve_web_archive(project, url, token)
+                archive_status = archived["retrieval_status"]
+                archive_attempts = archived.get("web_archive_attempts")
+                result = choose_best_record([result, archived])
+                # Record the archive outcome even when the origin's own failure
+                # is the more informative status and wins the merge; the walk is
+                # the audit trail for why an issue was or was not recovered.
+                result["web_archive_status"] = archive_status
+                if archive_attempts is not None:
+                    result["web_archive_attempts"] = archive_attempts
         assert result["retrieval_status"] in STATUSES
         _atomic_json(metadata_path, result)
         return result
@@ -530,6 +564,134 @@ class CachedRetriever:
             )
         return result
 
+    def _archive_get(self, url: str, **kwargs: Any) -> tuple[Any | None, dict[str, Any] | None]:
+        """One polite archive request; 401/403/429 open a circuit for the archive host."""
+        if WEB_ARCHIVE_HOST in self.blocked:
+            return None, {
+                "retrieval_status": self.blocked[WEB_ARCHIVE_HOST],
+                "error": "Web archive circuit open; retry later",
+            }
+        for attempt in range(self.retries):
+            self.sleep(self.delay if attempt == 0 else max(self.delay, 2**attempt))
+            try:
+                response = self.session.get(url, timeout=(10, 60), **kwargs)
+            except requests.RequestException:
+                if attempt + 1 == self.retries:
+                    return None, {
+                        "retrieval_status": "NETWORK_ERROR",
+                        "error": "Web archive request failed",
+                    }
+                continue
+            status = response.status_code
+            if status in (401, 403, 429):
+                blocked = "RATE_LIMITED" if status == 429 else "AUTH_REQUIRED"
+                self.blocked[WEB_ARCHIVE_HOST] = blocked
+                return None, {
+                    "retrieval_status": blocked,
+                    "error": f"Web archive returned HTTP {status}; no bypass attempted",
+                    "retry_after": response.headers.get("Retry-After"),
+                }
+            if status in (404, 410):
+                return None, {
+                    "retrieval_status": "NOT_FOUND",
+                    "error": f"Web archive returned HTTP {status}",
+                }
+            if status >= 500:
+                if attempt + 1 < self.retries:
+                    continue
+                return None, {
+                    "retrieval_status": "NETWORK_ERROR",
+                    "error": f"Web archive returned HTTP {status}",
+                }
+            if status != 200:
+                return None, {
+                    "retrieval_status": "NETWORK_ERROR",
+                    "error": f"Web archive returned HTTP {status}",
+                }
+            return response, None
+        raise AssertionError("unreachable")
+
+    def _retrieve_web_archive(self, project: str, url: str, token: str) -> dict[str, Any]:
+        """Read an archived copy of a public page whose origin refuses automated clients."""
+        result = self._base_result(url)
+        result.update(retrieval_source="WEB_ARCHIVE", archive_of=url)
+        listing, failure = self._archive_get(
+            WEB_ARCHIVE_CDX,
+            params={
+                "url": url,
+                "output": "json",
+                "filter": "statuscode:200",
+                "collapse": "digest",
+                "fl": "timestamp,digest,length",
+                "limit": "20",
+            },
+        )
+        if failure:
+            result.update(failure)
+            return result
+        try:
+            rows = json.loads(listing.content or b"[]")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            result.update(
+                retrieval_status="PARSE_ERROR", error="Web archive index returned invalid JSON"
+            )
+            return result
+        snapshots = rows[1:] if rows and isinstance(rows[0], list) else []
+        if not snapshots:
+            result.update(
+                retrieval_status="NOT_FOUND", error="No archived snapshot of this tracker page"
+            )
+            return result
+        # Captures are chronological and the earliest is closest to the historical
+        # report, but a crawler can capture a login wall instead of the report. Walk
+        # forward through a bounded number of captures and keep the first that parses
+        # as a real report, so one unusable capture does not discard the issue.
+        attempts: list[dict[str, str]] = []
+        for row in snapshots[:WEB_ARCHIVE_MAX_SNAPSHOTS]:
+            timestamp = string_value(row[0])
+            if not timestamp:
+                continue
+            snapshot_url = WEB_ARCHIVE_SNAPSHOT.format(timestamp=timestamp, url=url)
+            response, failure = self._archive_get(snapshot_url, allow_redirects=False)
+            if failure:
+                # A blocked or rate-limited archive ends the walk; it is not a
+                # statement about the remaining captures.
+                result.update(failure)
+                result["web_archive_attempts"] = json.dumps(attempts)
+                return result
+            parsed = parse_tracker_html(project, response.content)
+            if parsed["retrieval_status"] == "AUTH_REQUIRED":
+                # An archived login/challenge page is not usable evidence.
+                parsed = {
+                    "retrieval_status": "EMPTY_CONTENT",
+                    "error": "Archived snapshot captured a login or challenge page",
+                }
+            attempts.append({"timestamp": timestamp, "status": parsed["retrieval_status"]})
+            candidate = {**result, **parsed, "archive_timestamp": timestamp}
+            if not _usable(candidate) and len(attempts) < WEB_ARCHIVE_MAX_SNAPSHOTS:
+                continue
+            raw_path = self.cache / f"{token}.archive.html"
+            temporary = raw_path.with_suffix(".html.tmp")
+            temporary.write_bytes(response.content)
+            temporary.replace(raw_path)
+            result["raw_responses"] = [
+                {"kind": "archive", "file": raw_path.name, "sha256": sha256_file(raw_path)}
+            ]
+            result.update(parsed)
+            result.update(
+                retrieval_source="WEB_ARCHIVE",
+                archive_timestamp=timestamp,
+                archive_url=snapshot_url,
+                web_archive_attempts=json.dumps(attempts),
+            )
+            return result
+        result.update(
+            retrieval_status="EMPTY_CONTENT",
+            error=f"No capture parsed as a report in {len(attempts)} attempts",
+            web_archive_attempts=json.dumps(attempts),
+        )
+        return result
+
 
 def load_manual_imports(directory: str | Path | None) -> tuple[dict[str, dict], dict[str, str]]:
     records: dict[str, dict] = {}
@@ -588,21 +750,27 @@ def _usable(record: dict[str, Any]) -> bool:
 
 
 def _quality(record: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    # Transient "we were refused" outcomes outrank the terminal NOT_FOUND claim.
+    # Reporting "this issue does not exist" when retrieval was merely blocked
+    # misdirects the operator into abandoning recoverable data, so a blocked or
+    # failed request must never be masked by an older NOT_FOUND record. Every
+    # status has a distinct rank: no status comparison depends on input order.
     status_rank = {
-        "SUCCESS": 5,
-        "EMPTY_CONTENT": 4,
-        "AUTH_REQUIRED": 3,
-        "AUTH_FAILED": 3,
+        "SUCCESS": 7,
+        "EMPTY_CONTENT": 6,
+        "AUTH_REQUIRED": 5,
+        "AUTH_FAILED": 5,
+        "RATE_LIMITED": 4,
+        "NETWORK_ERROR": 3,
         "NOT_FOUND": 2,
-        "RATE_LIMITED": 2,
-        "NETWORK_ERROR": 1,
         "PARSE_ERROR": 1,
         "UNSUPPORTED": 0,
     }.get(record.get("retrieval_status"), -1)
     values = [string_value(record.get(field)).strip() for field in TEXT_FIELDS]
     source_rank = {
-        "AUTO_REMOTE": 4,
-        "PRIOR_REPORT": 3,
+        "AUTO_REMOTE": 5,
+        "PRIOR_REPORT": 4,
+        "WEB_ARCHIVE": 3,
         "MANUAL_IMPORT": 2,
         "AUTO": 1,
     }.get(record.get("retrieval_source"), 0)
@@ -647,6 +815,8 @@ def _preserve_safe_provenance(record: dict[str, Any], row: dict[str, Any]) -> No
         "manual_source_file",
         "manual_source_sha256",
         "upstream_retrieval_source",
+        "archive_timestamp",
+        "archive_url",
     ):
         value = string_value(row.get(field))
         if value:
@@ -754,6 +924,7 @@ def enrich_mandelbugs(
     prior_reports: list[str | Path] | None = None,
     only_issue: str | None = None,
     only_project: str | None = None,
+    allow_web_archive: bool = False,
 ) -> dict[str, Any]:
     all_labels = validate_labels(pd.read_parquet(labels_path))
     labels = all_labels
@@ -779,7 +950,9 @@ def enrich_mandelbugs(
     if extraneous:
         raise ValueError(f"Manual issue IDs absent from official labels: {sorted(extraneous)}")
     imported, prior_audits = load_prior_reports(prior_reports, set(all_labels.issue_key))
-    retriever = CachedRetriever(cache_dir, sleep_seconds)
+    retriever = CachedRetriever(
+        cache_dir, sleep_seconds, allow_web_archive=allow_web_archive and not offline
+    )
     existing: dict[str, dict[str, Any]] = {}
     if (out / "reports.parquet").exists():
         prior = pd.read_parquet(out / "reports.parquet")
@@ -884,6 +1057,12 @@ def enrich_mandelbugs(
         "prior_reports": prior_audits,
         "only_issue": only_issue,
         "only_project": only_project,
+        "allow_web_archive": bool(allow_web_archive and not offline),
+        "web_archive_rows": int(
+            (reports.retrieval_source == "WEB_ARCHIVE").sum()
+            if "retrieval_source" in reports
+            else 0
+        ),
         "readiness": readiness,
         "text_version": TEXT_VERSION,
         "parser_version": PARSER_VERSION,

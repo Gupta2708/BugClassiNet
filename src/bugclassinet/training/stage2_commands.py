@@ -26,6 +26,7 @@ def dispatch(args: argparse.Namespace) -> None:
             args.prior_reports,
             args.only_issue,
             args.only_project,
+            args.allow_web_archive,
         )
     elif args.command == "mandelbugs-prepare":
         from bugclassinet.data.mandelbugs_prepare import prepare_mandelbugs
@@ -74,6 +75,14 @@ def register_commands(commands: argparse._SubParsersAction) -> None:
             sub.add_argument("--manual-dir", default="data/manual_enrichment")
             sub.add_argument("--retry-failures", action="store_true")
             sub.add_argument("--offline", action="store_true")
+            sub.add_argument(
+                "--allow-web-archive",
+                action="store_true",
+                help=(
+                    "Read public Internet Archive snapshots for trackers that refuse "
+                    "automated clients (MySQL). The blocked origin is never contacted."
+                ),
+            )
             sub.add_argument(
                 "--prior-reports",
                 action="append",

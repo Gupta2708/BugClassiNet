@@ -338,3 +338,213 @@ def test_four_project_readiness_requires_both_classes():
     )
     assert only_boh["both_stage2_classes_each_project"] is False
     assert only_boh["recommended_for_four_project_lopo"] is False
+
+
+MYSQL_ARCHIVED_PAGE = b"""
+<html><head><title>MySQL Bugs: #21704: Renaming column</title></head>
+<body><h1>Bug #21704: Renaming column</h1>
+<table><tr><td>Submitted:</td><td>17 Aug 2006 22:21</td></tr>
+<tr><td>OS:</td><td>Linux</td></tr><tr><td>CPU Architecture:</td><td>Any</td></tr></table>
+<pre>Description:
+Renaming a column does not update the foreign key definition.</pre>
+<pre>A later public comment.</pre>
+</body></html>
+"""
+
+
+def raw_response(status=200, content=b"", headers=None):
+    return SimpleNamespace(status_code=status, content=content, headers=headers or {})
+
+
+def test_web_archive_fallback_recovers_a_blocked_mysql_page(tmp_path):
+    """A 403 from the origin falls back to the archive without retrying the origin."""
+    session = RecordingSession(
+        [
+            raw_response(403, b"<html><title>Technical Difficulties</title></html>"),
+            raw_response(200, json.dumps([["timestamp"], ["20080311100430"]]).encode()),
+            raw_response(200, MYSQL_ARCHIVED_PAGE),
+        ]
+    )
+    record = retrieval.CachedRetriever(
+        tmp_path, session=session, sleeper=lambda _: None, allow_web_archive=True
+    ).retrieve("MySQL", "21704")
+    assert record["retrieval_status"] == "SUCCESS"
+    assert record["retrieval_source"] == "WEB_ARCHIVE"
+    assert record["archive_timestamp"] == "20080311100430"
+    assert "foreign key definition" in record["initial_description"]
+    # The blocked origin is contacted once, then never again.
+    hosts = [url.split("/")[2] for url, _ in session.calls]
+    assert hosts.count("bugs.mysql.com") == 1
+    assert hosts.count(retrieval.WEB_ARCHIVE_HOST) == 2
+
+
+def test_web_archive_is_opt_in_and_never_reached_by_default(tmp_path):
+    session = RecordingSession([raw_response(403, b"<html><title>Denied</title></html>")])
+    record = retrieval.CachedRetriever(tmp_path, session=session, sleeper=lambda _: None).retrieve(
+        "MySQL", "21704"
+    )
+    assert record["retrieval_status"] == "AUTH_REQUIRED"
+    assert all(retrieval.WEB_ARCHIVE_HOST not in url for url, _ in session.calls)
+
+
+def test_archived_login_page_is_not_accepted_as_evidence(tmp_path):
+    session = RecordingSession(
+        [
+            raw_response(403, b"<html><title>Denied</title></html>"),
+            raw_response(200, json.dumps([["timestamp"], ["20080311100430"]]).encode()),
+            raw_response(200, b"<html><title>Log in</title><body>Sign in</body></html>"),
+        ]
+    )
+    record = retrieval.CachedRetriever(
+        tmp_path, session=session, sleeper=lambda _: None, allow_web_archive=True
+    ).retrieve("MySQL", "21704")
+    assert record["retrieval_status"] != "SUCCESS"
+
+
+def test_missing_snapshot_is_recorded_without_masking_the_origin_block(tmp_path):
+    session = RecordingSession(
+        [
+            raw_response(403, b"<html><title>Denied</title></html>"),
+            raw_response(200, b"[]"),
+        ]
+    )
+    record = retrieval.CachedRetriever(
+        tmp_path, session=session, sleeper=lambda _: None, allow_web_archive=True
+    ).retrieve("MySQL", "21704")
+    # The origin's own block is the more informative status and wins the merge,
+    # but the archive outcome is still recorded for the audit.
+    assert record["retrieval_status"] == "AUTH_REQUIRED"
+    assert record["web_archive_status"] == "NOT_FOUND"
+
+
+def test_blocked_status_is_never_masked_by_a_stale_not_found():
+    """The regression that reported rate-limited HTTPD retrievals as NOT_FOUND."""
+    stale = {"retrieval_status": "NOT_FOUND", "retrieval_source": "AUTO_REMOTE"}
+    blocked = {"retrieval_status": "RATE_LIMITED", "retrieval_source": "AUTO_REMOTE"}
+    # Order must not decide the outcome: the transient failure wins either way.
+    assert retrieval.choose_best_record([stale, blocked])["retrieval_status"] == "RATE_LIMITED"
+    assert retrieval.choose_best_record([blocked, stale])["retrieval_status"] == "RATE_LIMITED"
+
+
+@pytest.mark.parametrize(
+    "transient", ["RATE_LIMITED", "AUTH_REQUIRED", "AUTH_FAILED", "NETWORK_ERROR"]
+)
+def test_every_transient_failure_outranks_not_found(transient):
+    stale = {"retrieval_status": "NOT_FOUND", "retrieval_source": "AUTO_REMOTE"}
+    fresh = {"retrieval_status": transient, "retrieval_source": "AUTO_REMOTE"}
+    assert retrieval.choose_best_record([stale, fresh])["retrieval_status"] == transient
+
+
+def test_usable_evidence_still_beats_every_failure():
+    good = {
+        "retrieval_status": "SUCCESS",
+        "retrieval_source": "WEB_ARCHIVE",
+        "initial_description": "a real report body",
+    }
+    blocked = {"retrieval_status": "RATE_LIMITED", "retrieval_source": "AUTO_REMOTE"}
+    assert retrieval.choose_best_record([blocked, good])["retrieval_status"] == "SUCCESS"
+
+
+def bugzilla_payloads(returned_id, comment_key):
+    bug = {"bugs": [{"id": returned_id, "summary": "Summary", "component": "core"}]}
+    comments = {
+        "bugs": {comment_key: {"comments": [{"count": 0, "id": 1, "text": "Initial report."}]}}
+    }
+    return bug, comments
+
+
+def test_alias_or_moved_bug_is_kept_and_recorded():
+    """A canonical id differing from the requested id is evidence, not a PARSE_ERROR."""
+    bug, comments = bugzilla_payloads(9999, "9999")
+    parsed = retrieval.parse_bugzilla_rest("1234", bug, comments)
+    assert parsed["retrieval_status"] == "SUCCESS"
+    assert parsed["initial_description"] == "Initial report."
+    assert parsed["tracker_resolved_bug_id"] == "9999"
+    assert parsed["tracker_id_substituted"] is True
+
+
+def test_exact_id_match_is_not_flagged_as_substituted():
+    bug, comments = bugzilla_payloads(1234, "1234")
+    parsed = retrieval.parse_bugzilla_rest("1234", bug, comments)
+    assert parsed["retrieval_status"] == "SUCCESS"
+    assert parsed["tracker_id_substituted"] is False
+
+
+def test_response_without_an_identifier_is_still_rejected():
+    bug = {"bugs": [{"summary": "Summary"}]}
+    with pytest.raises(ValueError):
+        retrieval.parse_bugzilla_rest("1234", bug, {"bugs": {}})
+
+
+def test_multiple_bugs_in_one_response_are_still_rejected():
+    bug = {"bugs": [{"id": 1}, {"id": 2}]}
+    with pytest.raises(ValueError):
+        retrieval.parse_bugzilla_rest("1", bug, {"bugs": {}})
+
+
+LOGIN_CAPTURE = b"<html><title>Log in to MySQL Bugs</title><body>Please log in</body></html>"
+
+
+def test_snapshot_walk_skips_login_captures_and_keeps_the_first_real_report(tmp_path):
+    """The recovery for captures where the crawler hit a login wall."""
+    index = json.dumps(
+        [["timestamp"], ["20080728061450"], ["20080801044712"], ["20080928070640"]]
+    ).encode()
+    session = RecordingSession(
+        [
+            raw_response(403, b"<html><title>Technical Difficulties</title></html>"),
+            raw_response(200, index),
+            raw_response(200, LOGIN_CAPTURE),
+            raw_response(200, LOGIN_CAPTURE),
+            raw_response(200, MYSQL_ARCHIVED_PAGE),
+        ]
+    )
+    record = retrieval.CachedRetriever(
+        tmp_path, session=session, sleeper=lambda _: None, allow_web_archive=True
+    ).retrieve("MySQL", "38185")
+    assert record["retrieval_status"] == "SUCCESS"
+    # The capture that actually parsed is the one recorded, not the earliest.
+    assert record["archive_timestamp"] == "20080928070640"
+    assert "foreign key definition" in record["initial_description"]
+    attempts = json.loads(record["web_archive_attempts"])
+    assert [item["status"] for item in attempts] == [
+        "EMPTY_CONTENT",
+        "EMPTY_CONTENT",
+        "SUCCESS",
+    ]
+
+
+def test_snapshot_walk_is_bounded_and_reports_exhaustion(tmp_path, monkeypatch):
+    monkeypatch.setattr(retrieval, "WEB_ARCHIVE_MAX_SNAPSHOTS", 3)
+    index = json.dumps([["timestamp"], ["1"], ["2"], ["3"], ["4"], ["5"]]).encode()
+    session = RecordingSession(
+        [
+            raw_response(403, b"<html><title>Denied</title></html>"),
+            raw_response(200, index),
+            *[raw_response(200, LOGIN_CAPTURE) for _ in range(3)],
+        ]
+    )
+    record = retrieval.CachedRetriever(
+        tmp_path, session=session, sleeper=lambda _: None, allow_web_archive=True
+    ).retrieve("MySQL", "38185")
+    assert record["web_archive_status"] == "EMPTY_CONTENT"
+    # Exactly the bounded number of captures is fetched, never all of them.
+    assert len(json.loads(record["web_archive_attempts"])) == 3
+
+
+def test_snapshot_walk_stops_immediately_when_the_archive_rate_limits(tmp_path):
+    index = json.dumps([["timestamp"], ["1"], ["2"], ["3"]]).encode()
+    session = RecordingSession(
+        [
+            raw_response(403, b"<html><title>Denied</title></html>"),
+            raw_response(200, index),
+            raw_response(200, LOGIN_CAPTURE),
+            raw_response(429, b"", {"Retry-After": "60"}),
+        ]
+    )
+    record = retrieval.CachedRetriever(
+        tmp_path, session=session, sleeper=lambda _: None, allow_web_archive=True
+    ).retrieve("MySQL", "38185")
+    # Rate limiting is not evidence that the remaining captures are unusable.
+    assert record["web_archive_status"] == "RATE_LIMITED"
+    assert len(json.loads(record["web_archive_attempts"])) == 1

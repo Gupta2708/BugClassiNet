@@ -89,13 +89,18 @@ Read-only probes on 2026-09-09 (one issue per tracker, not a full coverage test)
 | Tracker/sample | Observed result | Action |
 |---|---|---|
 | Linux 1436 | HTTP 200; description parsed | Verify more records during enrichment |
-| MySQL 21704 | HTTP 403 | Manual/authorized export required from this environment |
-| HTTPD 7441 | HTTP 200 anti-bot challenge | Manual/authorized export required; no bypass |
+| MySQL 21704 | HTTP 403 (Akamai edge, host-wide) | Resolved by `--allow-web-archive` |
+| HTTPD 7441 | HTTP 200 anti-bot challenge | Resolved by the authenticated Bugzilla REST API |
 | AXIS AXIS-1 | HTTP 200; description parsed | Verify more records during enrichment |
 
 These are environment- and time-specific results, not guarantees about all IDs.
 An unknown layout produces PARSE_ERROR, an empty description EMPTY_CONTENT.
 401/403/429 or a recognized anti-bot page opens a host circuit for that run.
+When several records describe one issue, a transient failure (`RATE_LIMITED`,
+`AUTH_REQUIRED`, `AUTH_FAILED`, `NETWORK_ERROR`) always outranks the terminal
+`NOT_FOUND` claim, and every status has a distinct rank, so no reported status
+depends on candidate order. Reporting "this issue does not exist" for a merely
+blocked retrieval misdirects the operator into abandoning recoverable data.
 Redirects are recorded as UNSUPPORTED for manual verification, not blindly
 followed. Requests use a descriptive User-Agent, serial delay, bounded retries
 and exponential backoff for connection/5xx errors. `Retry-After` is recorded;
@@ -152,7 +157,57 @@ If that succeeds, collect all MySQL reports into a new local output directory:
 ```
 
 The project selector prevents this local collection run from contacting other
-trackers. Upload `reports.parquet` as a private Kaggle dataset and pass it with
+trackers.
+
+#### When the MySQL origin refuses every automated client
+
+Observed on 2026-09-09 from a local desktop: `https://bugs.mysql.com/bug.php?id=21704`
+and the site root both return **HTTP 403** from `AkamaiGHost` with Oracle's generic
+"Technical Difficulties" page. The block is host-wide and client-based, not per
+issue and not an authentication prompt, so no key, delay, or retry resolves it.
+Browser spoofing, proxy rotation and anti-bot bypass remain prohibited.
+
+`--allow-web-archive` adds an explicit, opt-in fallback to the public Internet
+Archive for MySQL only. It queries the documented CDX index for captures of the
+same tracker URL, walks forward from the **earliest** `statuscode:200` capture
+through at most `WEB_ARCHIVE_MAX_SNAPSHOTS` (8) candidates, and fetches each
+with the `id_` modifier so the archived bytes arrive without Wayback's injected
+banner or rewritten links. The first capture that parses as a real report wins:
+a crawler can capture a login wall instead of the report, and one unusable
+capture must not discard an otherwise recoverable issue. `web_archive_attempts`
+records every capture tried and its outcome. A rate-limited or blocked archive
+ends the walk and is reported as such, never as "no usable capture". The
+existing MySQL parser then applies unchanged. The
+blocked origin is contacted once, fails, and is never retried; the archive is a
+different public source, not a bypass of Oracle's edge.
+
+```powershell
+.\.venv\Scripts\python.exe -m bugclassinet.cli mandelbugs-enrich `
+  --labels data\interim\mandelbugs_labels\labels.parquet `
+  --output-dir data\interim\mandelbugs_mysql_reports `
+  --cache-dir data\interim\mandelbugs_mysql_cache `
+  --manual-dir data\manual_enrichment `
+  --sleep-seconds 3.0 `
+  --retry-failures `
+  --allow-web-archive `
+  --only-project MySQL
+```
+
+Records use `retrieval_source=WEB_ARCHIVE` and carry `archive_timestamp` and
+`archive_url`; `retrieval_audit.json` reports `allow_web_archive` and
+`web_archive_rows`. `_quality` ranks `WEB_ARCHIVE` below live `AUTO_REMOTE` and
+`PRIOR_REPORT` but above manual imports, so a later direct retrieval supersedes an
+archived one. An origin failure that is more informative than "no snapshot" still
+wins the merge, and the archive outcome is preserved in `web_archive_status`. An
+archived login or challenge capture is rejected as `EMPTY_CONTENT`, never accepted
+as evidence. The archive rate-limits: use `--sleep-seconds 3.0` or higher, since
+each issue costs one index query plus one capture fetch.
+
+Two limitations belong in any write-up. Coverage is partial — issues with no
+capture are a genuine `NOT_FOUND` and a source of selection bias. And capture
+dates differ per issue, so publish `archive_timestamp` alongside the retrieval
+date; an early capture is closer to the historical report than today's page, but
+it is still not guaranteed to be the report as filed. Upload `reports.parquet` as a private Kaggle dataset and pass it with
 repeatable `--prior-reports`. Only SUCCESS rows
 with nonblank descriptions are eligible. The audit records the imported file
 name, SHA-256, row count, eligible rows, and reused identities. Final rows use
@@ -172,7 +227,12 @@ For the ASF deployment, requests use the native `/bugzilla/rest.cgi` entry
 point because its optional `/bugzilla/rest` rewrite returns an HTML 404. The
 canonical documented `Bugzilla_api_key` parameter is used.
 It extracts summary, creation time, public comment zero, later public comments,
-OS, hardware, and component metadata. Private comments are excluded. Status and
+OS, hardware, and component metadata. Private comments are excluded. A requested
+id can be an alias of, or have been merged into, a different canonical issue;
+that response is still evidence for the annotated bug, so it is retained with
+`tracker_resolved_bug_id` and `tracker_id_substituted` recording the
+substitution, and comments are read under the canonical id the server returned.
+Responses carrying no identifier, or more than one bug, are still rejected. Status and
 resolution can exist in the raw response but are never copied into default model
 text. API endpoints saved to disk contain no credentials.
 
@@ -243,6 +303,38 @@ fixes; no claim of semantic anonymization is made. Full comments can reveal
 post-resolution knowledge, so report `initial` and `full` as separate evidence
 conditions. Neither is guaranteed to reconstruct the exact historical report
 at issue creation; publish retrieval dates and this limitation.
+
+### Observed completed retrieval
+
+Recorded on 2026-09-09, after the authenticated HTTPD route and the MySQL
+archive fallback. These are observed run outputs, not asserted constants:
+
+| Project | Unique IDs | Successful | Coverage | BOH usable | MANDELBUG usable |
+|---|---:|---:|---:|---:|---:|
+| HTTPD | 143 | 143 | 1.000 | 116 | 25 |
+| MySQL | 216 | 213 | 0.986 | 123 | 77 |
+
+HTTPD retrieval reproduces the official annotation table exactly
+(116 BOH, 15 NAM, 10 ARB, 2 UNK). Two earlier HTTPD attempts are instructive
+and are recorded here because both produced misleading audits rather than
+obvious errors:
+
+- An unauthenticated attempt cached `NOT_FOUND` for the whole project. ASF
+  Bugzilla now requires login even for public bugs, and its REST API answers
+  anonymous requests with HTTP 401.
+- A later authenticated attempt retrieved 30 issues in 110 seconds and then
+  tripped the rate limiter. The remaining 113 issues were never requested, and
+  the stale `NOT_FOUND` records outranked the fresh rate-limit records under the
+  previous tie-breaking rule, so the audit reported 113 nonexistent bugs. The
+  status ranking above was corrected in response. Use a fresh output directory
+  and `--sleep-seconds 3.0` for a full-project ASF run.
+
+Three MySQL issues (`48993`, `50451`, `56982`) have no capture of any status in
+the archive and remain unretrieved; `48993` is already quarantined as a
+duplicate-ID conflict, so two classified issues are lost. Five further issues
+were recovered only by the capture walk, needing between two and five candidates
+each, and would have been reported as `EMPTY_CONTENT` by a single-capture
+strategy.
 
 ## Evaluation protocol and baselines
 
