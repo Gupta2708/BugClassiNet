@@ -23,6 +23,9 @@ def dispatch(args: argparse.Namespace) -> None:
             args.manual_dir,
             args.retry_failures,
             args.offline,
+            args.prior_reports,
+            args.only_issue,
+            args.only_project,
         )
     elif args.command == "mandelbugs-prepare":
         from bugclassinet.data.mandelbugs_prepare import prepare_mandelbugs
@@ -71,6 +74,20 @@ def register_commands(commands: argparse._SubParsersAction) -> None:
             sub.add_argument("--manual-dir", default="data/manual_enrichment")
             sub.add_argument("--retry-failures", action="store_true")
             sub.add_argument("--offline", action="store_true")
+            sub.add_argument(
+                "--prior-reports",
+                action="append",
+                help="Existing reports.parquet to reuse; may be specified more than once",
+            )
+            selector = sub.add_mutually_exclusive_group()
+            selector.add_argument(
+                "--only-issue", help="Retrieve one official identity, e.g. MySQL:21704"
+            )
+            selector.add_argument(
+                "--only-project",
+                choices=["Linux", "MySQL", "HTTPD", "AXIS"],
+                help="Retrieve only one official project (useful for portable local runs)",
+            )
         elif name == "mandelbugs-prepare":
             sub.add_argument("--labels", required=True)
             sub.add_argument("--reports", required=True)

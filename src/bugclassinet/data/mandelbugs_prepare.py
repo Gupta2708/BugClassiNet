@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from bugclassinet.data.harmonize import normalised_text_hash
+from bugclassinet.data.mandelbugs_enrich import coverage_readiness
 from bugclassinet.data.mandelbugs_schema import TEXT_VERSION, construct_evidence, validate_labels
 from bugclassinet.utils.checksums import sha256_file
 from bugclassinet.utils.io import write_json
@@ -80,6 +81,9 @@ def prepare_mandelbugs(
         out / "unenriched_classified.csv", index=False
     )
     ready.to_parquet(out / "stage2.parquet", index=False)
+    readiness = coverage_readiness(labels, joined, ready)
+    pd.DataFrame(readiness["projects"]).to_csv(out / "stage2_readiness.csv", index=False)
+    write_json(out / "stage2_readiness.json", readiness)
     audit = {
         "label_rows": len(labels),
         "stage2_rows": len(ready),
@@ -102,6 +106,7 @@ def prepare_mandelbugs(
             "same-label text retained; cross-partition text purged from training per fold"
         ),
         "training_invoked": False,
+        "readiness": readiness,
     }
     write_json(out / "stage2_dataset_audit.json", audit)
     return audit

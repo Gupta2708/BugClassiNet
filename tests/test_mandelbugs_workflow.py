@@ -229,7 +229,12 @@ def test_adapter_content_and_manual_priority(retrieval):
         ]
         == "EMPTY_CONTENT"
     )
-    good = {"retrieval_status": "SUCCESS", "title": "prior"}
+    good = {
+        "retrieval_status": "SUCCESS",
+        "retrieval_source": "AUTO_REMOTE",
+        "title": "prior",
+        "initial_description": "richer prior description",
+    }
     assert retrieval.merge_manual(good, {"title": "replacement"}) == good
     assert (
         retrieval.merge_manual({"retrieval_status": "AUTH_REQUIRED"}, {"title": "manual"})[

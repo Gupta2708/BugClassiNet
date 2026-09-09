@@ -102,6 +102,125 @@ and exponential backoff for connection/5xx errors. `Retry-After` is recorded;
 rate-limited hosts are not retried in the same run. Responses and metadata use
 atomic cache writes; raw caches are checksum-checked when reused.
 
+### Preserved first cloud retrieval
+
+The first anonymous Kaggle enrichment at Git commit
+`a0ba6dc53663de969422aaf0c7bbd9b97c90ed54` is preserved as evidence. It
+processed all 852 source annotations and observed 487 SUCCESS, 364
+AUTH_REQUIRED, and one EMPTY_CONTENT result:
+
+| Project | SUCCESS | AUTH_REQUIRED | EMPTY_CONTENT |
+|---|---:|---:|---:|
+| Linux | 289 | 0 | 0 |
+| AXIS | 198 | 0 | 1 |
+| HTTPD | 0 | 143 | 0 |
+| MySQL | 0 | 221 | 0 |
+
+This was an anonymous/cloud result, not evidence that the underlying reports
+are unavailable. The sampled MySQL historical page is publicly accessible in a
+normal browser, while Kaggle was blocked. Retrieve MySQL from a permitted local
+environment and import its successful `reports.parquet`. Access Apache HTTPD
+only through its documented authenticated Bugzilla REST API. No browser
+spoofing, proxy rotation, authentication bypass, anti-bot bypass, or repeated
+403 retry is permitted.
+
+### Portable MySQL and authenticated HTTPD completion
+
+One-report local MySQL smoke test (always use a dedicated output directory):
+
+```powershell
+.\.venv\Scripts\python.exe -m bugclassinet.cli mandelbugs-enrich `
+  --labels data\interim\mandelbugs_labels\labels.parquet `
+  --output-dir outputs\smoke\mysql-21704 `
+  --cache-dir data\interim\mandelbugs_mysql_cache `
+  --manual-dir data\manual_enrichment `
+  --retry-failures `
+  --only-issue MySQL:21704
+```
+
+If that succeeds, collect all MySQL reports into a new local output directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m bugclassinet.cli mandelbugs-enrich `
+  --labels data\interim\mandelbugs_labels\labels.parquet `
+  --output-dir data\interim\mandelbugs_mysql_reports `
+  --cache-dir data\interim\mandelbugs_mysql_cache `
+  --manual-dir data\manual_enrichment `
+  --sleep-seconds 1.0 `
+  --retry-failures `
+  --only-project MySQL
+```
+
+The project selector prevents this local collection run from contacting other
+trackers. Upload `reports.parquet` as a private Kaggle dataset and pass it with
+repeatable `--prior-reports`. Only SUCCESS rows
+with nonblank descriptions are eligible. The audit records the imported file
+name, SHA-256, row count, eligible rows, and reused identities. Final rows use
+`retrieval_source=PRIOR_REPORT` and retain the upstream source value. No source
+machine path is written to the manifest.
+
+Apache Bugzilla documents
+[`GET /rest/bug/{id}`](https://bz.apache.org/bugzilla/docs/en/html/api/core/v1/bug.html)
+and
+[`GET /rest/bug/{id}/comment`](https://bz.apache.org/bugzilla/docs/en/html/api/core/v1/comment.html),
+with comment zero being the description. The
+adapter uses those JSON endpoints and the documented `api_key` call argument.
+Authentication follows the official
+[Bugzilla REST general API documentation](https://bz.apache.org/bugzilla/docs/en/html/api/core/v1/general.html);
+no HTML-login automation is used.
+It extracts summary, creation time, public comment zero, later public comments,
+OS, hardware, and component metadata. Private comments are excluded. Status and
+resolution can exist in the raw response but are never copied into default model
+text. API endpoints saved to disk contain no credentials.
+
+Credentials are read only from `BUGCLASSINET_APACHE_BUGZILLA_API_KEY`. They are
+not accepted as CLI arguments and are never printed, included in exceptions,
+manifests, cache metadata, or saved endpoint URLs. Missing credentials produce
+AUTH_REQUIRED; rejected credentials produce AUTH_FAILED; 429 produces
+RATE_LIMITED; 404/410 produces NOT_FOUND. Authentication and rate-limit failures
+open a host circuit for the current run. To retry after replacing an invalid key,
+pass `--retry-failures`.
+
+In Kaggle, load the secret immediately before enrichment:
+
+```python
+import os
+from kaggle_secrets import UserSecretsClient
+
+os.environ["BUGCLASSINET_APACHE_BUGZILLA_API_KEY"] = UserSecretsClient().get_secret(
+    "APACHE_BUGZILLA_API_KEY"
+)
+```
+
+Then merge the current Linux/AXIS report snapshot, local MySQL results, manual
+AXIS fallback, and authenticated HTTPD retrieval:
+
+```bash
+python -m bugclassinet.cli mandelbugs-enrich \
+  --labels /kaggle/working/stage2/labels/labels.parquet \
+  --output-dir /kaggle/working/stage2/final_reports \
+  --cache-dir /kaggle/working/stage2/final_cache \
+  --prior-reports /kaggle/input/first-cloud-reports/reports.parquet \
+  --prior-reports /kaggle/input/local-mysql-reports/reports.parquet \
+  --manual-dir /kaggle/input/mandelbugs-manual-imports
+```
+
+For a later entirely offline reconstruction, supply every saved successful
+snapshot plus manual imports and add `--offline`. Offline always forbids network
+access, even with `--retry-failures`. A previous successful record, prior report,
+and manual record are compared deterministically: usable content outranks any
+failure, more populated content fields outrank fewer, and only materially richer
+text replaces otherwise equivalent stable evidence. Source type is the final
+tie-breaker. `merge_candidate_sources` records the sources considered.
+
+Both enrichment and preparation write `stage2_readiness.csv/json`. The table
+reports source rows, unique IDs, successful and classified-successful reports,
+BOH/NAM/ARB/MANDELBUG usable counts, UNK count, and coverage for every project.
+`recommended_for_four_project_lopo` becomes true only when all Linux, MySQL,
+HTTPD, and AXIS data are present and each has usable BOH and MANDELBUG examples.
+Preparation recomputes readiness after duplicate/conflict quarantine; use that
+final value before LOPO training.
+
 ```bash
 python -m bugclassinet.cli mandelbugs-prepare --labels data/interim/mandelbugs_labels/labels.parquet --reports data/interim/mandelbugs_reports/reports.parquet --output-dir data/processed/mandelbugs_stage2
 ```
