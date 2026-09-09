@@ -61,9 +61,12 @@ def _deferred(name: str) -> Callable[[argparse.Namespace], None]:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the documented CLI parser."""
+    from bugclassinet.training.stage2_commands import register_commands
+
     parser = argparse.ArgumentParser(prog="python -m bugclassinet.cli")
     parser.add_argument("--verbose", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
+    register_commands(commands)
     inspect = commands.add_parser("inspect-archive")
     inspect.add_argument("archive")
     inspect.set_defaults(func=_inspect)

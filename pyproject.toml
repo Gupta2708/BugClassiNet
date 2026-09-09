@@ -14,6 +14,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+stage2 = [
+  "requests>=2.31", "beautifulsoup4>=4.12", "sentence-transformers>=3.0",
+  "transformers>=4.49"
+]
 transformers = [
   "transformers>=4.47", "accelerate>=1.0", "torch>=2.2", "datasets>=2.18",
   "sentencepiece>=0.2", "protobuf>=4.25"

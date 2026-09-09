@@ -1,0 +1,7 @@
+seed: 42
+word_min_df: 2
+word_max_df: 1.0
+word_max_features: 50000
+C: 1.0
+max_iter: 5000
+bootstrap_iterations: 1000

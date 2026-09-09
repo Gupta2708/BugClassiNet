@@ -2,7 +2,20 @@
 
 Reproducible, hierarchical classification of software issues. Stage 1 labels an
 issue as `BUG`, `ENHANCEMENT`, `QUESTION`, or `DOCUMENTATION`; bug reports then
-route through BOH/MAN and ARB/NAM classifiers.
+route through Stage 2 (`BOH` / `MANDELBUG`) and a planned Stage 3 (`NAM` / `ARB`).
+
+## Stage-2 research workflow
+
+Stage 1 is complete and frozen. The new Mandelbugs workflow provides audited
+ARFF labels, cached/manual issue enrichment, four-project LOPO baselines,
+optional frozen Stage-1 encoder transfer, and a separate low-data ModernBERT
+trainer. No Stage-2 research results are claimed until experiments are run.
+
+See [the Stage-2 protocol and commands](docs/stage2_mandelbugs.md) and
+[the thin Kaggle notebook](notebooks/kaggle/12_stage2_mandelbugs_lopo.ipynb).
+The new commands are `mandelbugs-audit`, `mandelbugs-enrich`, `mandelbugs-prepare`,
+`train-stage2-baseline`, and `train-stage2-modernbert`. Existing commands and
+Stage-1 configurations/checkpoint semantics are unchanged.
 
 ## Local quick start
 

@@ -24,3 +24,5 @@ data/gold/*
 *.safetensors
 *.bin
 *.tar.gz
+data/manual_enrichment/*
+!data/manual_enrichment/README.md

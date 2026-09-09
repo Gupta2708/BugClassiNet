@@ -1,0 +1,8 @@
+seed: 42
+encoder_name: sentence-transformers/all-mpnet-base-v2
+encoder_revision: null
+embedding_max_length: 384
+embedding_batch_size: 16
+C: 1.0
+max_iter: 5000
+bootstrap_iterations: 1000
