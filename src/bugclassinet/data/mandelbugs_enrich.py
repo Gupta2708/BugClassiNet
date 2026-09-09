@@ -47,7 +47,9 @@ STATUSES = {
 TEXT_FIELDS = ("title", "initial_description", "comments_text", "environment_text")
 PARSER_VERSION = "historical-tracker-v2"
 APACHE_API_KEY_ENV = "BUGCLASSINET_APACHE_BUGZILLA_API_KEY"
-APACHE_REST_ROOT = "https://bz.apache.org/bugzilla/rest"
+# ASF does not expose the optional /rest rewrite: that path returns an HTML
+# 404. Use Bugzilla's native REST script entry point for this installation.
+APACHE_REST_ROOT = "https://bz.apache.org/bugzilla/rest.cgi"
 SAFE_TRACKER_METADATA = ("tracker_component", "tracker_operating_system", "tracker_platform")
 
 
@@ -396,7 +398,7 @@ class CachedRetriever:
             try:
                 response = self.session.get(
                     endpoint,
-                    params={"api_key": api_key},
+                    params={"Bugzilla_api_key": api_key},
                     headers={"Accept": "application/json", "Content-Type": "application/json"},
                     timeout=(10, 45),
                     allow_redirects=False,

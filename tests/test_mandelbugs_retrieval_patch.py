@@ -132,8 +132,9 @@ def test_httpd_api_key_success_is_secret_safe(tmp_path, monkeypatch, caplog):
     assert record["comments_text"] == "Public follow-up"
     assert record["environment_text"] == "Operating system: Linux\nHardware: x86"
     assert record["tracker_component"] == "Core"
-    assert all(call[1]["params"] == {"api_key": secret} for call in session.calls)
-    assert all("api_key" not in call[0] for call in session.calls)
+    assert all(call[1]["params"] == {"Bugzilla_api_key": secret} for call in session.calls)
+    assert all("Bugzilla_api_key" not in call[0] for call in session.calls)
+    assert all("/rest.cgi/bug/7441" in call[0] for call in session.calls)
     saved = "\n".join(path.read_text(errors="ignore") for path in tmp_path.iterdir())
     assert secret not in saved and secret not in caplog.text and secret not in json.dumps(record)
     evidence = construct_evidence(record)[1]

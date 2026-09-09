@@ -163,11 +163,14 @@ Apache Bugzilla documents
 [`GET /rest/bug/{id}`](https://bz.apache.org/bugzilla/docs/en/html/api/core/v1/bug.html)
 and
 [`GET /rest/bug/{id}/comment`](https://bz.apache.org/bugzilla/docs/en/html/api/core/v1/comment.html),
-with comment zero being the description. The
-adapter uses those JSON endpoints and the documented `api_key` call argument.
+with comment zero being the description. The adapter uses those JSON endpoints
+and the documented `Bugzilla_api_key` call argument.
 Authentication follows the official
 [Bugzilla REST general API documentation](https://bz.apache.org/bugzilla/docs/en/html/api/core/v1/general.html);
 no HTML-login automation is used.
+For the ASF deployment, requests use the native `/bugzilla/rest.cgi` entry
+point because its optional `/bugzilla/rest` rewrite returns an HTML 404. The
+canonical documented `Bugzilla_api_key` parameter is used.
 It extracts summary, creation time, public comment zero, later public comments,
 OS, hardware, and component metadata. Private comments are excluded. Status and
 resolution can exist in the raw response but are never copied into default model
