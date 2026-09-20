@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 import shutil
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -160,7 +160,7 @@ def _load_checkpoint_model_state(checkpoint: Path, torch: Any) -> dict[str, Any]
     if pytorch_weights.is_file():
         return torch.load(pytorch_weights, map_location="cpu", weights_only=True)
     raise ValueError(
-        "Strict Stage-1 resume requires a single model.safetensors or pytorch_model.bin file; "
+        "Strict resume requires a single model.safetensors or pytorch_model.bin file; "
         f"no supported model state was found in {checkpoint}"
     )
 
@@ -313,9 +313,27 @@ def _require_resume_checkpoint(path: str | Path, use_fp16: bool) -> tuple[Path, 
     return checkpoint, json.loads(manifest_path.read_text(encoding="utf-8"))
 
 
+def _migrate_stored_manifest(stored: dict[str, Any]) -> dict[str, Any]:
+    """Rename superseded manifest keys so pre-existing checkpoints still resume.
+
+    ``class_weight_ratios_to_bug`` was written when the trainer assumed a Stage-1
+    BUG reference class. The successor field holds the same ratios whenever the
+    reference class is unchanged, so comparing them directly keeps a genuine
+    configuration change detectable while an unrelated rename does not abort a
+    resumable run.
+    """
+    legacy = {"class_weight_ratios_to_bug": "class_weight_ratios_to_reference"}
+    migrated = dict(stored)
+    for old_key, new_key in legacy.items():
+        if old_key in migrated and new_key not in migrated:
+            migrated[new_key] = migrated.pop(old_key)
+    return migrated
+
+
 def _validate_resume_manifest(
     stored: dict[str, Any], current: dict[str, Any], checkpoint: Path
 ) -> dict[str, int | float]:
+    stored = _migrate_stored_manifest(stored)
     stable_identity_available = bool(
         stored.get("train_source_sha256") and stored.get("validation_source_sha256")
     )
@@ -386,7 +404,8 @@ def _validate_resume_manifest(
         "class_weight_strategy",
         "class_weight_exponent",
         "class_weights_by_label",
-        "class_weight_ratios_to_bug",
+        "class_weight_reference_label",
+        "class_weight_ratios_to_reference",
         "cross_entropy_weighted",
         "cross_entropy_class_weights",
         "max_length",
@@ -675,6 +694,12 @@ def _dataframe_dataset(frame: pd.DataFrame, retain_metadata: bool) -> Any:
     return Dataset.from_pandas(frame.loc[:, columns], preserve_index=False)
 
 
+def _projection_columns(source: Path) -> list[str]:
+    """Project the content columns plus whatever stable identifier the source has."""
+    identifier = identifier_column(pq.read_schema(source).names)
+    return [*([identifier] if identifier else []), "text", "canonical_label"]
+
+
 def _load_inputs(
     train: Any,
     validation: Any,
@@ -682,15 +707,20 @@ def _load_inputs(
     max_train_samples: int | None,
     seed: int,
 ) -> tuple[Any, Any, bool]:
-    """Load projected, disk-backed Stage-1 data or adapt existing in-memory inputs."""
+    """Load projected, disk-backed data or adapt existing in-memory inputs."""
     if isinstance(train, (str, Path)) and isinstance(validation, (str, Path)):
         log_memory(LOGGER, "before dataset load")
+        # Keep whichever stable identifier the source carries. Stage 1 harmonizes
+        # to issue_id; the Mandelbugs Stage-2/3 datasets carry issue_key. Neither
+        # is fabricated here when absent.
         train_dataset = load_parquet_dataset(
-            Path(train), ["issue_id", "text", "canonical_label"], cache_dir / "raw-train"
+            Path(train),
+            _projection_columns(Path(train)),
+            cache_dir / "raw-train",
         )
         validation_dataset = load_parquet_dataset(
             Path(validation),
-            ["issue_id", "text", "canonical_label"],
+            _projection_columns(Path(validation)),
             cache_dir / "raw-validation",
         )
         log_memory(
@@ -763,6 +793,47 @@ def _resolve_class_weights(
     return weights
 
 
+#: Stable identifier columns the shared trainer understands, in preference order.
+#: Stage 1 harmonizes to ``issue_id``; the Mandelbugs Stage-2/3 datasets use
+#: ``issue_key``. Neither is required: identity falls back to content columns.
+_IDENTIFIER_COLUMNS = ("issue_id", "issue_key")
+
+
+def identifier_column(columns: Iterable[str]) -> str | None:
+    """Return the stable identifier column present in ``columns``, if any."""
+    available = set(columns)
+    return next((name for name in _IDENTIFIER_COLUMNS if name in available), None)
+
+
+def _class_weight_diagnostics(
+    labels: list[str],
+    train_counts: dict[str, int],
+    effective_weights: Sequence[float],
+) -> dict[str, Any]:
+    """Describe resolved class weights without assuming any task-specific label.
+
+    The reference class is the most frequent training class, chosen only so the
+    logged ratios have a stable denominator. It never enters the loss: the
+    optimizer consumes ``selected_weights`` exactly as ``_resolve_class_weights``
+    returned them.
+    """
+    class_weights_by_label = dict(zip(labels, effective_weights, strict=True))
+    reference_label = max(labels, key=lambda label: (train_counts[label], label))
+    reference_weight = class_weights_by_label[reference_label]
+    # A zero reference weight cannot happen for the supported strategies, but a
+    # diagnostic must never be the thing that crashes a training run.
+    weight_ratios_to_reference = (
+        None
+        if not reference_weight
+        else {label: weight / reference_weight for label, weight in class_weights_by_label.items()}
+    )
+    return {
+        "class_weights_by_label": class_weights_by_label,
+        "reference_label": reference_label,
+        "weight_ratios_to_reference": weight_ratios_to_reference,
+    }
+
+
 def train_transformer(
     train: Any,
     validation: Any,
@@ -813,8 +884,19 @@ def train_transformer(
     train_source_identity = (
         _source_file_identity(train_path, ["text", "canonical_label"]) if train_path else None
     )
+    # Source identity verification still requires content columns; a stable
+    # identifier is verified only when the source actually publishes one.
+    validation_required_columns = ["text", "canonical_label"]
+    if validation_path:
+        validation_identifier = identifier_column(pq.read_schema(Path(validation_path)).names)
+        if validation_identifier:
+            validation_required_columns = [
+                validation_identifier,
+                "text",
+                "canonical_label",
+            ]
     validation_source_identity = (
-        _source_file_identity(validation_path, ["issue_id", "text", "canonical_label"])
+        _source_file_identity(validation_path, validation_required_columns)
         if validation_path
         else None
     )
@@ -839,10 +921,10 @@ def train_transformer(
     train_sample_fingerprint = stable_sample_fingerprint(train)
     train_schema_columns = list(train.column_names)
     validation_schema_columns = list(validation.column_names)
-    LOGGER.info("Stage-1 training class counts=%s", train_counts)
-    LOGGER.info("Stage-1 validation class counts=%s", validation_counts)
+    LOGGER.info("Transformer training class counts=%s", train_counts)
+    LOGGER.info("Transformer validation class counts=%s", validation_counts)
     LOGGER.info(
-        "Stage-1 ordered sample fingerprint=%s rows=%d seed=%d sample_limit=%s",
+        "Transformer ordered sample fingerprint=%s rows=%d seed=%d sample_limit=%s",
         train_sample_fingerprint,
         len(train),
         config.seed,
@@ -864,12 +946,13 @@ def train_transformer(
         validation_rows=len(tokenized_validation),
     )
 
-    # Path-backed Stage 1 no longer needs raw text: both token tables are
+    # Path-backed runs no longer need raw text: both token tables are
     # memory-mapped. The pandas adapter preserves Stage-2/3 prediction schemas.
     prediction_columns = [
         column for column in validation.column_names if preserve_validation_text or column != "text"
     ]
     validation_metadata = validation.select_columns(prediction_columns)
+    validation_identifier_column = identifier_column(validation_metadata.column_names)
     del train, validation
     gc.collect()
 
@@ -894,21 +977,19 @@ def train_transformer(
         None if selected_weights is None else torch.tensor(selected_weights, dtype=torch.float)
     )
     class_weights = effective_weights.tolist()
-    class_weights_by_label = dict(zip(labels, class_weights, strict=True))
-    if "BUG" not in class_weights_by_label:
-        raise ValueError("Stage-1 class weights require the BUG reference class")
-    bug_weight = class_weights_by_label["BUG"]
-    weight_ratios_to_bug = {
-        label: weight / bug_weight for label, weight in class_weights_by_label.items()
-    }
+    diagnostics = _class_weight_diagnostics(labels, train_counts, class_weights)
+    class_weights_by_label = diagnostics["class_weights_by_label"]
+    reference_label = diagnostics["reference_label"]
+    weight_ratios_to_reference = diagnostics["weight_ratios_to_reference"]
     LOGGER.info(
-        "Stage-1 loss class_weight_strategy=%s class_weight_exponent=%s class_counts=%s "
-        "class_weights=%s weight_ratios_to_bug=%s",
+        "Transformer loss class_weight_strategy=%s class_weight_exponent=%s class_counts=%s "
+        "class_weights=%s reference_label=%s weight_ratios_to_reference=%s",
         config.class_weight_strategy,
         _CLASS_WEIGHT_EXPONENTS.get(config.class_weight_strategy),
         train_counts,
         class_weights_by_label,
-        weight_ratios_to_bug,
+        reference_label,
+        weight_ratios_to_reference,
     )
     preloaded_resume_checkpoint: str | None = None
     resume_state_summary: dict[str, int | float] | None = None
@@ -1057,7 +1138,7 @@ def train_transformer(
             else validation_schema_columns
         ),
         "train_required_columns": ["text", "canonical_label"],
-        "validation_required_columns": ["issue_id", "text", "canonical_label"],
+        "validation_required_columns": validation_required_columns,
         "train_checksum_provenance": (
             train_source_identity["checksum_provenance"] if train_source_identity else []
         ),
@@ -1073,7 +1154,8 @@ def train_transformer(
         "label_mapping_hash": _json_hash(label_to_id),
         "class_weights": class_weights,
         "class_weights_by_label": class_weights_by_label,
-        "class_weight_ratios_to_bug": weight_ratios_to_bug,
+        "class_weight_reference_label": reference_label,
+        "class_weight_ratios_to_reference": weight_ratios_to_reference,
         "class_weight_strategy": config.class_weight_strategy,
         "class_weight_exponent": _CLASS_WEIGHT_EXPONENTS.get(config.class_weight_strategy),
         "cross_entropy_weighted": selected_weights is not None,
@@ -1186,7 +1268,7 @@ def train_transformer(
     logits = np.asarray(prediction.predictions)
     if logits.ndim != 2 or logits.shape != (len(tokenized_validation), len(labels)):
         raise ValueError(
-            "Unexpected Stage-1 prediction shape: "
+            "Unexpected transformer prediction shape: "
             f"expected={(len(tokenized_validation), len(labels))}, actual={logits.shape}"
         )
     predicted_labels = [id_to_label[int(value)] for value in np.argmax(logits, axis=1)]
@@ -1202,10 +1284,11 @@ def train_transformer(
         logits=logits,
         score_label_order=labels,
         issue_ids=(
-            list(validation_metadata["issue_id"])
-            if "issue_id" in validation_metadata.column_names
+            list(validation_metadata[validation_identifier_column])
+            if validation_identifier_column
             else None
         ),
+        issue_id_column=validation_identifier_column or "issue_id",
     )
     metrics = {
         (f"eval_{key.removeprefix('test_')}" if key.startswith("test_") else key): value

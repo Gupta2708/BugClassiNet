@@ -15,9 +15,11 @@ from bugclassinet.utils.io import write_json
 STAGE1_REPORT_LABELS = ("BUG", "DOCUMENTATION", "ENHANCEMENT", "QUESTION")
 
 
-def _classification_report_frame(report: Mapping[str, Any]) -> pd.DataFrame:
+def _classification_report_frame(
+    report: Mapping[str, Any], labels: Sequence[str] = STAGE1_REPORT_LABELS
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    ordered_rows = [*STAGE1_REPORT_LABELS, "accuracy", "macro avg", "weighted avg"]
+    ordered_rows = [*labels, "accuracy", "macro avg", "weighted avg"]
     for name in ordered_rows:
         value = report.get(name)
         if value is None:
@@ -88,16 +90,24 @@ def write_stage1_evaluation(
     logits: np.ndarray | None = None,
     score_label_order: Sequence[str] | None = None,
     issue_ids: Sequence[Any] | None = None,
+    issue_id_column: str = "issue_id",
 ) -> dict[str, Any]:
-    """Compute, print, and save one complete Stage-1 evaluation package."""
+    """Compute, print, and save one complete evaluation package.
+
+    The report label order comes from ``label_to_id`` so the same writer serves
+    Stage 1 (BUG/DOCUMENTATION/ENHANCEMENT/QUESTION), Stage 2 (BOH/MANDELBUG)
+    and Stage 3 (ARB/NAM). Stage-1 callers are unaffected: their mapping is built
+    from ``sorted(labels)``, which reproduces ``STAGE1_REPORT_LABELS`` exactly.
+    """
     truth = list(true_labels)
     predictions = list(predicted_labels)
     if len(truth) != len(predictions):
         raise ValueError("Evaluation targets and predictions have different row counts")
-    if set(label_to_id) != set(STAGE1_REPORT_LABELS):
-        raise ValueError(f"Stage-1 label mapping must contain exactly {list(STAGE1_REPORT_LABELS)}")
+    if not label_to_id:
+        raise ValueError("Evaluation requires a non-empty label mapping")
+    report_labels = tuple(sorted(label_to_id, key=lambda label: label_to_id[label]))
 
-    metrics = classification_metrics(truth, predictions, labels=STAGE1_REPORT_LABELS)
+    metrics = classification_metrics(truth, predictions, labels=report_labels)
     if eval_loss is not None:
         metrics["eval_loss"] = float(eval_loss)
 
@@ -111,28 +121,28 @@ def write_stage1_evaluation(
                 "f1": float(report[label]["f1-score"]),
                 "support": int(report[label]["support"]),
             }
-            for label in STAGE1_REPORT_LABELS
+            for label in report_labels
         ]
     )
     matrix = pd.DataFrame(
         metrics["confusion_matrix"],
-        index=[f"TRUE_{label}" for label in STAGE1_REPORT_LABELS],
-        columns=[f"PRED_{label}" for label in STAGE1_REPORT_LABELS],
+        index=[f"TRUE_{label}" for label in report_labels],
+        columns=[f"PRED_{label}" for label in report_labels],
     )
     counts = pd.DataFrame(
         {
-            "class": STAGE1_REPORT_LABELS,
-            "true_count": [truth.count(label) for label in STAGE1_REPORT_LABELS],
-            "predicted_count": [predictions.count(label) for label in STAGE1_REPORT_LABELS],
+            "class": report_labels,
+            "true_count": [truth.count(label) for label in report_labels],
+            "predicted_count": [predictions.count(label) for label in report_labels],
         }
     )
-    full_report = _classification_report_frame(report)
+    full_report = _classification_report_frame(report, report_labels)
 
     metrics["true_class_counts"] = dict(
-        zip(STAGE1_REPORT_LABELS, counts["true_count"].tolist(), strict=True)
+        zip(report_labels, counts["true_count"].tolist(), strict=True)
     )
     metrics["predicted_class_counts"] = dict(
-        zip(STAGE1_REPORT_LABELS, counts["predicted_count"].tolist(), strict=True)
+        zip(report_labels, counts["predicted_count"].tolist(), strict=True)
     )
 
     target = Path(output_dir)
@@ -152,10 +162,10 @@ def write_stage1_evaluation(
     if issue_ids is not None:
         if len(issue_ids) != len(truth):
             raise ValueError("Issue ID count differs from evaluation row count")
-        rows = {"issue_id": list(issue_ids), **rows}
+        rows = {issue_id_column: list(issue_ids), **rows}
     if logits is not None:
         values = np.asarray(logits, dtype=np.float32)
-        score_labels = list(score_label_order or STAGE1_REPORT_LABELS)
+        score_labels = list(score_label_order or report_labels)
         if values.shape != (len(truth), len(score_labels)):
             raise ValueError(
                 "Logit shape does not match rows/classes: "

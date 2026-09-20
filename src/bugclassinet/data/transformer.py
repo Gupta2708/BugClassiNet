@@ -93,9 +93,12 @@ def _safe_cache_component(value: str) -> str:
 
 def stable_sample_fingerprint(dataset: Any) -> str:
     """Hash the ordered training identities without materializing Python row copies."""
-    identity_columns = (
-        ["issue_id"] if "issue_id" in dataset.column_names else ["text", "canonical_label"]
-    )
+    # Prefer whichever stable identifier the dataset publishes (Stage 1 uses
+    # issue_id, the Mandelbugs Stage-2/3 datasets use issue_key) and fall back to
+    # content columns rather than fabricating an identity.
+    available = set(dataset.column_names)
+    identifier = next((name for name in ("issue_id", "issue_key") if name in available), None)
+    identity_columns = [identifier] if identifier else ["text", "canonical_label"]
     identity = dataset.select_columns(identity_columns)
     digest = hashlib.sha256()
     digest.update(_SAMPLE_FINGERPRINT_VERSION.encode("utf-8"))

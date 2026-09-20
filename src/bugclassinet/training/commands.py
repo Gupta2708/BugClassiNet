@@ -84,6 +84,8 @@ def train_stage3(args: Any) -> None:
             args.output_dir,
             args.config,
             args.checkpoint,
+            # Optional: absent from the current parser, honored when supplied.
+            getattr(args, "evidence_mode", "initial"),
         )
     )
 

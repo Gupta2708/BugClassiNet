@@ -15,11 +15,12 @@ def run(
     output_dir: str,
     config_path: str | None,
     checkpoint: str | None,
+    evidence_mode: str = "initial",
 ) -> dict[str, object]:
     """Train ARB/NAM from a Stage 2 checkpoint with a fresh classification head."""
     training, valid = (
-        prepare_stage3(read_split(train, data_dir, "train")),
-        prepare_stage3(read_split(validation, data_dir, "validation")),
+        prepare_stage3(read_split(train, data_dir, "train"), evidence_mode),
+        prepare_stage3(read_split(validation, data_dir, "validation"), evidence_mode),
     )
     group_cross_validation_splits(training, min(5, training["project"].nunique()))
     values = training_config(

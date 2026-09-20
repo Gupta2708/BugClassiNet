@@ -105,6 +105,18 @@ def test_stage1_report_has_fixed_order_correct_metrics_and_artifacts(tmp_path, c
     assert "=== FULL CLASSIFICATION REPORT ===" in output
 
 
-def test_stage1_report_rejects_noncanonical_label_mapping(tmp_path) -> None:
-    with pytest.raises(ValueError, match="exactly"):
-        write_stage1_evaluation(tmp_path, ["BUG"], ["BUG"], {"BUG": 0})
+def test_report_requires_a_non_empty_label_mapping(tmp_path) -> None:
+    with pytest.raises(ValueError, match="non-empty label mapping"):
+        write_stage1_evaluation(tmp_path, [], [], {})
+
+
+def test_report_accepts_label_sets_without_the_stage1_classes(tmp_path) -> None:
+    """The shared writer serves Stage 2/3, whose label sets contain no BUG class."""
+    metrics = write_stage1_evaluation(
+        tmp_path, ["ARB", "NAM"], ["ARB", "NAM"], {"ARB": 0, "NAM": 1}
+    )
+    assert set(metrics["true_class_counts"]) == {"ARB", "NAM"}
+    per_class = pd.read_csv(tmp_path / "per_class_metrics.csv")
+    assert per_class["class"].tolist() == ["ARB", "NAM"]
+    matrix = pd.read_csv(tmp_path / "confusion_matrix.csv")
+    assert matrix.columns.tolist() == ["true_label", "PRED_ARB", "PRED_NAM"]
