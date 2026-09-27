@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🐛 BugClassiNet-Next
+# 🐛 BugClassiNet
 
 ### From raw GitHub issue text to a fine-grained bug taxonomy — one reproducible, imbalance-aware, three-stage cascade.
 
