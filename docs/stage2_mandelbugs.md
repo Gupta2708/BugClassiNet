@@ -6,7 +6,7 @@ adds a separate Stage-2 experiment suite, not a retraining of Stage 1.
 
 Stage 2 predicts `BOH` versus `MANDELBUG` on known bug reports. `BOH` maps to BOH;
 `NAM` and `ARB` map to MANDELBUG. `UNK` is retained separately. Stage 3 (NAM versus
-ARB) is planned; its labels are preserved but no Stage-3 training is implemented
+ARB) is now complete and frozen (see `docs/Reports/`); its labels are preserved
 by this workflow. Existing legacy `train-stage2` remains available unchanged;
 use the new commands below for the BOH/MANDELBUG LOPO research protocol.
 
